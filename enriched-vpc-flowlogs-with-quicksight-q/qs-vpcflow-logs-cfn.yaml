@@ -1,0 +1,1209 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'VPC Enriched Flowlogs With QuickSight Sample'
+Parameters:
+  BucketNameVpcLogsPrefix:
+    Type: String
+    Default: vpcflowlogs-bucket
+    Description: S3 Bucket Name Prefix. Will Be Appended With a Random Value to Become Unique
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID which VPC Flowlogs Will Be Enabled On
+  CostTag:
+    Type: String
+    Default: cost-tag
+    Description: The Cost Tag Key Which Will Be Retrieved From the EC2 Instances and Added to the VPC Flow Logs
+  QuicksightUserARN:
+    Description: The ARN of the Quicksight User with PRO role. e.g arn:aws:quicksight:us-east-1:123456789123:user/default/Admin/{username}
+    Type: String
+  QuicksightServiceRole:
+    Type: String
+    Default: aws-quicksight-service-role-v0
+    Description: The Quicksight Service role attached to QS, Default is aws-quicksight-service-role-v0
+  CreateQsTopic:
+    Type: String
+    Default: yes
+    AllowedValues:
+      - yes
+      - no
+    Description: Select if creation of the Amazon Q Topic is desired or not 
+
+Conditions:
+  CreateQsTopicResources: !Equals 
+    - !Ref CreateQsTopic
+    - yes
+
+Resources:
+  IAMRoleLambdaFunctionEnricher:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: "sts:AssumeRole"
+      Path: /
+      RoleName: "IAMRoleLambdaFunctionEnricher"
+  PolicyLambda:
+    Type:  AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: VpcFlowlogsEnricherLambdaPolicy
+      Roles:
+        - !Ref IAMRoleLambdaFunctionEnricher
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+            - s3:AbortMultipartUpload
+            - s3:GetBucketLocation
+            - s3:GetObject
+            - s3:ListBucket
+            - s3:ListBucketMultipartUploads
+            - s3:PutObject
+            Resource:
+            - Fn::Sub:
+              - "arn:aws:s3:::${S3Bucket}"
+              - S3Bucket:
+                  Ref: S3BucketVpcLogs
+            - Fn::Sub:
+              - "arn:aws:s3:::${S3Bucket}/*"
+              - S3Bucket:
+                  Ref: S3BucketVpcLogs
+          - Effect: Allow
+            Action:
+            - firehose:DeleteDeliveryStream
+            - firehose:PutRecord
+            - firehose:PutRecordBatch
+            - firehose:UpdateDestination
+            Resource: "arn:aws:firehose:*:*:*"
+          - Effect: Allow
+            Action:
+              - "logs:DescribeLogStreams"
+              - "logs:CreateLogGroup"
+              - "logs:CreateLogStream"
+              - "logs:PutLogEvents"
+            Resource: "arn:aws:logs:*:*:*"
+          - Effect: Allow
+            Action:
+              - ec2:DescribeInstances
+              - ec2:DescribeSecurityGroups
+            Resource: "*"
+  LambdaFunctionEnricher:
+    UpdateReplacePolicy: "Retain"
+    Type: "AWS::Lambda::Function"
+    DeletionPolicy: "Delete"
+    Properties:
+      MemorySize: 128
+      Description: ""
+      TracingConfig:
+        Mode: "PassThrough"
+      Timeout: 900
+      RuntimeManagementConfig:
+        UpdateRuntimeOn: "Auto"
+      Handler: "index.lambda_handler"
+      Code:
+        ZipFile: !Sub |
+          import base64
+          import json
+          import boto3
+          import io
+          import datetime
+          from collections import OrderedDict
+            
+
+
+          ec2_client = boto3.client('ec2')
+          ec2 = boto3.resource('ec2')
+
+          def lambda_handler(event, context):
+              """
+              This function processes vpc flow log records buffered by Amazon Kinesis Data Firehose. Each record is enriched with additional metadata 
+              like resource tags for source & destination IP address. VPC ID, Region, Subnet ID, Interface ID etc. for destination IP address.
+              """
+              output = []
+              instance_id=None
+              resource_sg = ""
+
+              vpc_fl_header = "account-id action az-id bytes dstaddr dstport end flow-direction instance-id interface-id log-status packets pkt-dst-aws-service pkt-dstaddr pkt-src-aws-service pkt-srcaddr protocol region srcaddr srcport start sublocation-id sublocation-type subnet-id tcp-flags traffic-path type version vpc-id"
+
+              for record in event['records']:
+                
+                  # Decode the payload with utf-8 to read the values from the record and enrich it
+                  payload = base64.b64decode(record['data']).decode('utf-8')
+                  
+                  # Custom processing to enrich the payload with SG id
+                  try:
+                      json_payload=json.loads(payload)
+                      
+                      # Original record from VPC Flow Logs is separated by space delimiter
+                      flow_log_record=json_payload["message"].split(" ")
+
+                      record_dict=OrderedDict({"account-id": flow_log_record[0], "action": flow_log_record[1], "az-id": flow_log_record[2], "bytes": flow_log_record[3], "dstaddr": flow_log_record[4], "dstport": flow_log_record[5], \
+                      "end": flow_log_record[6], "flow-direction": flow_log_record[7], "instance-id": flow_log_record[8], "interface-id": flow_log_record[9], "log-status": flow_log_record[10], \
+                      "packets": flow_log_record[11], "pkt-dst-aws-service": flow_log_record[12], "pkt-dstaddr": flow_log_record[13], "pkt-src-aws-service": flow_log_record[14], \
+                      "pkt-srcaddr": flow_log_record[15], "protocol": flow_log_record[16], "region": flow_log_record[17], "srcaddr": flow_log_record[18], "srcport": flow_log_record[19], \
+                      "start": flow_log_record[20], "sublocation-id": flow_log_record[21], "sublocation-type": flow_log_record[22], "subnet-id": flow_log_record[23], "tcp-flags": flow_log_record[24], \
+                      "traffic-path": flow_log_record[25], "type": flow_log_record[26], "version": flow_log_record[27], "vpc-id": flow_log_record[28]})
+                      
+                      instance_id = record_dict['instance-id']
+                      epoch_time_end = int(record_dict['end'])
+                      epoch_time_start = int(record_dict['start'])
+                      
+
+                      # Get the resource SG for instance id from the log record
+                      if instance_id:
+                          if len(instance_id) > 0 and instance_id.strip() != "-":
+                              security_groups = get_resource_sg(instance_id)
+                              cost_tag = get_resource_tag(instance_id)
+                              sg_1 = security_groups[0]
+                              record_dict["security-group-id"] = sg_1["GroupId"]
+                              record_dict["cost-tag"] = cost_tag
+                              
+                      record_dict["date_time_start"] = str(datetime.datetime.fromtimestamp( epoch_time_start))      
+                      record_dict["date_time_end"] = str(datetime.datetime.fromtimestamp( epoch_time_end ))          
+                                
+
+                      # Finally modify the payload with enriched record
+                      payload=json.dumps(record_dict) + "\n" 
+                      
+                      
+                  except Exception as ex:
+                      print('Could not process record, Exception: ', ex)
+                      output_record = {
+                          'recordId': record['recordId'],
+                          'result': 'ProcessingFailed',
+                          'data': base64.b64encode(payload.encode('utf-8')).decode('utf-8')
+                      }
+                  else:
+                      # Assign the enriched record to the output_record for Kinesis to process it further
+                      output_record = {
+                          'recordId': record['recordId'],
+                          'result': 'Ok',
+                          'data': base64.b64encode(payload.encode('utf-8')).decode('utf-8')
+                      }
+                      
+                      output.append(output_record)
+              
+              print('Successfully processed {} records.'.format(len(event['records'])))
+              print(output)
+              return {'records': output}
+              
+
+
+              
+          def get_resource_sg(resource_id):
+              """
+              This function fetches SG for resource_id parameter using boto3
+              """
+              try:
+                  ec2 = boto3.resource('ec2')
+                  ec2instance = ec2.Instance(resource_id)
+                  resource_sg=ec2instance.security_groups
+              except Exception as ex:
+                  print('Exception get_resource_tags: ', ex)
+                  
+              return resource_sg
+
+
+          def get_resource_tag(resource_id):
+              """
+              This function fetches '${CostTag}' value for resource_id parameter using boto3
+              """
+              cost_tags=None
+              try:
+                  ec2 = boto3.resource('ec2')
+                  ec2instance = ec2.Instance(resource_id)
+                  resource_cost_tag=ec2instance.tags
+                  
+                  for tag in ec2instance.tags:
+                      if tag['Key'] == '${CostTag}':
+                          cost_tags = tag['Value']
+                          
+              except Exception as ex:
+                  print('Exception get_resource_tags: ', ex)
+                  
+              return cost_tags
+
+      Role:
+        Fn::GetAtt:
+        - "IAMRoleLambdaFunctionEnricher"
+        - "Arn"
+      FileSystemConfigs: []
+      FunctionName: !Join ['-', ['vpcflowlogs-enricher-lambda', !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]]]
+      Runtime: "python3.12"
+      PackageType: "Zip"
+      LoggingConfig:
+        LogFormat: "Text"
+        LogGroup: !Join ['-', ['/aws/lambda/vpcflowlogs-enricher-lambda', !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]]]
+      EphemeralStorage:
+        Size: 512
+      Architectures:
+      - "x86_64"
+  S3BucketVpcLogs:
+    UpdateReplacePolicy: "Retain"
+    Type: "AWS::S3::Bucket"
+    DeletionPolicy: "Delete"
+    Properties:
+      BucketName: !Join ['-', [!Ref BucketNameVpcLogsPrefix, !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]]]
+      PublicAccessBlockConfiguration:
+        RestrictPublicBuckets: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        BlockPublicAcls: true
+      LifecycleConfiguration:
+        Rules:
+          - Status: Enabled
+            ExpirationInDays: 30
+            Id: 30-day-delete-rule
+      OwnershipControls:
+        Rules:
+        - ObjectOwnership: "BucketOwnerEnforced"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+        - BucketKeyEnabled: true
+          ServerSideEncryptionByDefault:
+            SSEAlgorithm: "AES256"
+  FirehoseDeliveryIAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - firehose.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+            Condition:
+              StringEquals:
+                "sts:ExternalId":
+                  Ref: AWS::AccountId
+      Path: /
+      RoleName: "FirehoseDeliveryIAMRole" 
+  PolicyFirehose:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: "FirehoseDatasteamPolicy"
+      Roles:
+        - !Ref FirehoseDeliveryIAMRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+            - s3:AbortMultipartUpload
+            - s3:GetBucketLocation
+            - s3:GetObject
+            - s3:ListBucket
+            - s3:ListBucketMultipartUploads
+            - s3:PutObject
+            Resource:
+            - Fn::Sub:
+              - "arn:aws:s3:::${S3Bucket}"
+              - S3Bucket:
+                  Ref: S3BucketVpcLogs
+            - Fn::Sub:
+              - "arn:aws:s3:::${S3Bucket}/*"
+              - S3Bucket:
+                  Ref: S3BucketVpcLogs
+          - Effect: Allow
+            Action:
+            - lambda:InvokeFunction
+            - lambda:GetFunctionConfiguration
+            Resource:
+            - !GetAtt LambdaFunctionEnricher.Arn
+          - Effect: Allow
+            Action:
+              - "logs:DescribeLogStreams"
+              - "logs:CreateLogGroup"
+              - "logs:CreateLogStream"
+              - "logs:PutLogEvents"
+            Resource: "arn:aws:logs:*:*:*" 
+  KinesisFirehoseDeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamName: !Join ['-', ['vpcflowlogs-firehose', !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]]]
+      DeliveryStreamType: DirectPut
+      ExtendedS3DestinationConfiguration:
+        BucketARN: !Sub "arn:aws:s3:::${S3BucketVpcLogs}"
+        ProcessingConfiguration:
+          Enabled: 'true'
+          Processors:
+            - Parameters:
+                - ParameterName: LambdaArn
+                  ParameterValue: !GetAtt LambdaFunctionEnricher.Arn
+              Type: Lambda
+        Prefix: "vpcflowlogs/"
+        EncryptionConfiguration:
+          NoEncryptionConfig: NoEncryption
+        CloudWatchLoggingOptions:
+          Enabled: true
+          LogGroupName: !Join ['-', ['vpc-logs', !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]]]
+          LogStreamName: 'S3Delivery'
+        RoleARN:
+          Fn::GetAtt:
+          - FirehoseDeliveryIAMRole
+          - Arn
+    DependsOn:
+    - FirehoseDeliveryIAMRole
+  VPCFlowLogsEnable:
+    UpdateReplacePolicy: "Retain"
+    Type: "AWS::EC2::FlowLog"
+    DeletionPolicy: "Delete"
+    Properties:
+      LogFormat: "${account-id} ${action} ${az-id} ${bytes} ${dstaddr} ${dstport}\
+        \ ${end} ${flow-direction} ${instance-id} ${interface-id} ${log-status} ${packets}\
+        \ ${pkt-dst-aws-service} ${pkt-dstaddr} ${pkt-src-aws-service} ${pkt-srcaddr}\
+        \ ${protocol} ${region} ${srcaddr} ${srcport} ${start} ${sublocation-id} ${sublocation-type}\
+        \ ${subnet-id} ${tcp-flags} ${traffic-path} ${type} ${version} ${vpc-id}"
+      ResourceId: !Ref VpcId
+      MaxAggregationInterval: 60
+      ResourceType: "VPC"
+      LogDestination: 
+        Fn::GetAtt:
+          - KinesisFirehoseDeliveryStream
+          - Arn
+      LogDestinationType: "kinesis-data-firehose"
+      TrafficType: "ACCEPT"
+      Tags: 
+        - Key: Name
+          Value: !Join ['-', [vpcflowlogs, !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]]]
+    DependsOn:
+    - KinesisFirehoseDeliveryStream 
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    DependsOn:
+    - KinesisFirehoseDeliveryStream
+    - LambdaFunctionEnricher
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Join ['-', [vpcflowlogs-database, !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]]]
+        Description: "AWS Glue container to hold vpc logs table"
+  GlueTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId:
+        Ref: AWS::AccountId
+      DatabaseName:
+        Ref: GlueDatabase
+      TableInput:
+        Name: vpcflowlogs
+        Description: AWS Glue Database Table Used for VPC Flowlogs
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          EXTERNAL: 'TRUE'
+          compressionType: 'none'
+          classification: "json"
+          typeOfData: 'file'
+          projection.enabled: 'true'
+          projection.date.type: date
+          projection.date.format: yyyy/MM/dd
+          projection.date.interval: '1'
+          projection.date.interval.unit: DAYS
+          projection.date.range: 2024/09/01,NOW
+          projection.hour.type: integer
+          projection.hour.digits: '2'
+          projection.hour.range: '0,23'
+          storage.location.template: !Sub "s3://${S3BucketVpcLogs}/vpcflowlogs/${!date}/${!hour}/"
+        StorageDescriptor:
+          Columns:
+            - Name: account-id
+              Type: string
+            - Name: action
+              Type: string
+            - Name: az-id
+              Type: string
+            - Name: bytes
+              Type: string
+            - Name: dstaddr
+              Type: string
+            - Name: dstport
+              Type: string
+            - Name: end
+              Type: string
+            - Name: flow-direction
+              Type: string
+            - Name: instance-id
+              Type: string
+            - Name: interface-id
+              Type: string
+            - Name: log-status
+              Type: string
+            - Name: packets
+              Type: string
+            - Name: pkt-dst-aws-service
+              Type: string
+            - Name: pkt-dstaddr
+              Type: string
+            - Name: pkt-src-aws-service
+              Type: string
+            - Name: pkt-srcaddr
+              Type: string
+            - Name: protocol
+              Type: string
+            - Name: region
+              Type: string
+            - Name: srcaddr
+              Type: string
+            - Name: srcport
+              Type: string
+            - Name: start
+              Type: string
+            - Name: sublocation-id
+              Type: string
+            - Name: sublocation-type
+              Type: string
+            - Name: subnet-id
+              Type: string
+            - Name: tcp-flags
+              Type: string
+            - Name: traffic-path
+              Type: string
+            - Name: type
+              Type: string
+            - Name: version
+              Type: string
+            - Name: vpc-id
+              Type: string
+            - Name: security-group-id
+              Type: string
+            - Name: cost-tag
+              Type: string
+            - Name: date_time_start
+              Type: string
+            - Name: date_time_end
+              Type: string
+          Location: !Sub "s3://${S3BucketVpcLogs}/vpcflowlogs/"
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          Compressed: False
+          StoredAsSubDirectories: False
+          SerdeInfo:
+            SerializationLibrary: org.openx.data.jsonserde.JsonSerDe
+            Parameters: {}
+          Parameters: {}
+        Retention: 0
+        PartitionKeys:
+          - Name: date
+            Type: string
+          - Name: hour
+            Type: string
+  QuicksightServiceRolePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: "Grants Amazon QuickSight access to Athena and the VPC Flowlogs S3 Bucket "
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: s3:ListAllMyBuckets
+            Resource: arn:aws:s3:::*
+          - Action:
+            - s3:ListBucket
+            Effect: Allow
+            Resource:
+            - Fn::Sub:
+              - "arn:aws:s3:::${S3Bucket}"
+              - S3Bucket:
+                  Ref: S3BucketVpcLogs
+          - Action:
+            - s3:GetObject
+            - s3:GetObjectVersion
+            Effect: Allow
+            Resource:
+            - Fn::Sub:
+              - "arn:aws:s3:::${S3Bucket}/*"
+              - S3Bucket:
+                  Ref: S3BucketVpcLogs
+          - Action:
+            - s3:ListBucketMultipartUploads
+            - s3:GetBucketLocation
+            Effect: Allow
+            Resource:
+            - Fn::Sub:
+              - "arn:aws:s3:::${S3Bucket}"
+              - S3Bucket:
+                  Ref: S3BucketVpcLogs
+          - Effect: Allow
+            Action:
+            - s3:PutObject
+            - s3:AbortMultipartUpload
+            - s3:ListMultipartUploadParts
+            Resource:
+            - Fn::Sub:
+              - "arn:aws:s3:::${S3Bucket}/*"
+              - S3Bucket:
+                  Ref: S3BucketVpcLogs
+          - Effect: "Allow"
+            Action:
+              - athena:BatchGetQueryExecution
+              - athena:CancelQueryExecution
+              - athena:GetCatalogs
+              - athena:GetExecutionEngine
+              - athena:GetExecutionEngines
+              - athena:GetNamespace
+              - athena:GetNamespaces
+              - athena:GetQueryExecution
+              - athena:GetQueryExecutions
+              - athena:GetQueryResults
+              - athena:GetQueryResultsStream
+              - athena:GetTable
+              - athena:GetTables
+              - athena:ListQueryExecutions
+              - athena:RunQuery
+              - athena:StartQueryExecution
+              - athena:StopQueryExecution
+              - athena:ListWorkGroups
+              - athena:ListEngineVersions
+              - athena:GetWorkGroup
+              - athena:GetDataCatalog
+              - athena:GetDatabase
+              - athena:GetTableMetadata
+              - athena:ListDataCatalogs
+              - athena:ListDatabases
+              - athena:ListTableMetadata
+            Resource: "*"
+      Roles: 
+       - !Ref QuicksightServiceRole
+  QsDataSource:
+    Type: AWS::QuickSight::DataSource
+    DependsOn:
+      - QuicksightServiceRolePolicy
+      - GlueTable
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      DataSourceId: !Join ['-', [vpcflowlogs-qs-datasource, !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]]]
+      Name: vpcflowlogs-datasource
+      Type: ATHENA
+      DataSourceParameters:
+        AthenaParameters:
+          WorkGroup: primary
+      SslProperties:
+        DisableSsl: false
+      Permissions: 
+        - Actions:
+            - "quicksight:UpdateDataSourcePermissions"
+            - "quicksight:DescribeDataSource"
+            - "quicksight:DescribeDataSourcePermissions"
+            - "quicksight:PassDataSource"
+            - "quicksight:UpdateDataSource"
+            - "quicksight:DeleteDataSource"
+          Principal: !Ref QuicksightUserARN
+  QsDataSet:
+    Type: AWS::QuickSight::DataSet
+    DependsOn:
+      - QsDataSource
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      Name: vpcflowlogs-dataset
+      DataSetId: !Join ['-', [vpcflowlogs-qs-dataset, !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]]]
+      DataSetUsageConfiguration:
+        DisableUseAsDirectQuerySource: false
+        DisableUseAsImportedSource: false
+      FieldFolders: {}
+      ImportMode: SPICE
+      LogicalTableMap:
+        vpcflowlogs-qs-tablemap:
+          Alias: !Join ['-', [vpcflowlogs-qs-tablemap-alias, !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]]]
+          DataTransforms:
+            - CastColumnTypeOperation:
+                ColumnName: bytes
+                NewColumnType: INTEGER
+            - CreateColumnsOperation:
+                Columns:
+                  - ColumnId: !Join ['-', [gigabytes, !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]]]
+                    ColumnName: gigabytes
+                    Expression: 'round(({bytes}/1000/1000/1000), 2)'
+            - CreateColumnsOperation:
+                Columns:
+                  - ColumnId: !Join ['-', [megabytes, !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]]]
+                    ColumnName: megabytes
+                    Expression: 'round(({bytes}/1000/1000), 2)'
+            - CreateColumnsOperation:
+                Columns:
+                  - ColumnId: !Join ['-', [start_datetime, !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]]]
+                    ColumnName: start_datetime
+                    Expression: 'parseDate({date_time_start}, ''yyyy-MM-dd HH:mm:ss'')'
+            - CreateColumnsOperation:
+                Columns:
+                  - ColumnId: !Join ['-', [end_datetime, !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]]]
+                    ColumnName: end_datetime
+                    Expression: 'parseDate({date_time_end},''yyyy-MM-dd HH:mm:ss'')'
+            - TagColumnOperation:
+                ColumnName: region
+                Tags:
+                  - ColumnGeographicRole: STATE
+            - ProjectOperation:
+                ProjectedColumns:
+                  - account-id
+                  - action
+                  - az-id
+                  - bytes
+                  - dstaddr
+                  - dstport
+                  - end
+                  - flow-direction
+                  - instance-id
+                  - interface-id
+                  - log-status
+                  - packets
+                  - pkt-dst-aws-service
+                  - pkt-dstaddr
+                  - pkt-src-aws-service
+                  - pkt-srcaddr
+                  - protocol
+                  - region
+                  - srcaddr
+                  - srcport
+                  - start
+                  - sublocation-id
+                  - sublocation-type
+                  - subnet-id
+                  - tcp-flags
+                  - traffic-path
+                  - type
+                  - version
+                  - vpc-id
+                  - security-group-id
+                  - date_time_start
+                  - date_time_end
+                  - cost-tag
+                  - gigabytes
+                  - megabytes
+                  - start_datetime
+                  - end_datetime
+          Source:
+            PhysicalTableId: vpcflowlogs-qs-physicaltable
+      PhysicalTableMap:
+        vpcflowlogs-qs-physicaltable:
+          RelationalTable:
+            Catalog: AwsDataCatalog
+            DataSourceArn:
+              'Fn::GetAtt':
+                - QsDataSource
+                - Arn
+            InputColumns:
+              - Name: account-id
+                Type: STRING
+              - Name: action
+                Type: STRING
+              - Name: az-id
+                Type: STRING
+              - Name: bytes
+                Type: STRING
+              - Name: dstaddr
+                Type: STRING
+              - Name: dstport
+                Type: STRING
+              - Name: end
+                Type: STRING
+              - Name: flow-direction
+                Type: STRING
+              - Name: instance-id
+                Type: STRING
+              - Name: interface-id
+                Type: STRING
+              - Name: log-status
+                Type: STRING
+              - Name: packets
+                Type: STRING
+              - Name: pkt-dst-aws-service
+                Type: STRING
+              - Name: pkt-dstaddr
+                Type: STRING
+              - Name: pkt-src-aws-service
+                Type: STRING
+              - Name: pkt-srcaddr
+                Type: STRING
+              - Name: protocol
+                Type: STRING
+              - Name: region
+                Type: STRING
+              - Name: srcaddr
+                Type: STRING
+              - Name: srcport
+                Type: STRING
+              - Name: start
+                Type: STRING
+              - Name: sublocation-id
+                Type: STRING
+              - Name: sublocation-type
+                Type: STRING
+              - Name: subnet-id
+                Type: STRING
+              - Name: tcp-flags
+                Type: STRING
+              - Name: traffic-path
+                Type: STRING
+              - Name: type
+                Type: STRING
+              - Name: version
+                Type: STRING
+              - Name: vpc-id
+                Type: STRING
+              - Name: security-group-id
+                Type: STRING
+              - Name: date_time_start
+                Type: STRING
+              - Name: date_time_end
+                Type: STRING
+              - Name: cost-tag
+                Type: STRING
+            Name: vpcflowlogs
+            Schema: !Ref GlueDatabase
+      Permissions: 
+        - Actions:
+            - "quicksight:DeleteDataSet"
+            - "quicksight:CreateIngestion"
+            - "quicksight:CancelIngestion"
+            - "quicksight:DescribeDataSet"
+            - "quicksight:DescribeDataSetPermissions"
+            - "quicksight:PassDataSet"
+            - "quicksight:DescribeIngestion"
+            - "quicksight:ListIngestions"
+            - "quicksight:UpdateDataSetPermissions"
+            - "quicksight:UpdateDataSet"
+          Principal: !Ref QuicksightUserARN
+  QsTopic:
+    Type: AWS::QuickSight::Topic
+    Condition: CreateQsTopicResources
+    DependsOn:
+      - QsDataScheduleDelay
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      Name: vpcflowlogs-topic
+      Description: "Quicksight Topic Containing Synonyms"
+      TopicId: !Join ['-', [vpcflowlogs-qs-topic, !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]]]
+      UserExperienceVersion: NEW_READER_EXPERIENCE
+      DataSets: 
+        - DatasetArn: !GetAtt QsDataSet.Arn
+          DatasetName: vpcflowlogs-dataset
+          Columns: 
+            - ColumnName: bytes
+              ColumnFriendlyName: Bytes
+              ColumnDataRole: MEASURE
+              IsIncludedInTopic: true
+            - ColumnName: megabytes
+              ColumnFriendlyName: Megabytes
+              ColumnSynonyms: 
+                - mb
+              ColumnDataRole: MEASURE
+              IsIncludedInTopic: true
+            - ColumnName: gigabytes
+              ColumnFriendlyName: Gigabytes
+              ColumnSynonyms: 
+                - gb
+                - data
+                - traffic
+              ColumnDataRole: MEASURE
+              IsIncludedInTopic: true
+            - ColumnName: start_datetime
+              ColumnFriendlyName: Start Datetime
+              ColumnSynonyms: 
+                - start date
+                - begining
+              ColumnDataRole: DIMENSION
+              IsIncludedInTopic: true
+            - ColumnName: end_datetime
+              ColumnFriendlyName: End Datetime
+              ColumnSynonyms: 
+                - end date
+                - ending
+              ColumnDataRole: DIMENSION
+              IsIncludedInTopic: true
+            - ColumnName: account-id
+              ColumnFriendlyName: Account Id
+              ColumnSynonyms: 
+                - account
+                - account number
+              ColumnDataRole: DIMENSION
+              IsIncludedInTopic: true
+            - ColumnName: action
+              ColumnFriendlyName: Action
+              ColumnDataRole: DIMENSION
+              IsIncludedInTopic: false
+            - ColumnName: az-id
+              ColumnFriendlyName: Availability Zone Id
+              ColumnSynonyms: 
+                - az
+                - availability zone
+              ColumnDataRole: DIMENSION
+              IsIncludedInTopic: true
+            - ColumnName: date_time_end
+              ColumnFriendlyName: Date Time End
+              ColumnDataRole: DIMENSION
+              IsIncludedInTopic: false
+            - ColumnName: date_time_start
+              ColumnFriendlyName: Date Time Start
+              ColumnDataRole: DIMENSION
+              IsIncludedInTopic: false
+            - ColumnName: dstaddr
+              ColumnFriendlyName: Dstaddr
+              ColumnSynonyms: 
+                - destination address
+                - destination ip
+              ColumnDataRole: DIMENSION
+              IsIncludedInTopic: true
+            - ColumnName: srcaddr
+              ColumnFriendlyName: Srcaddr
+              ColumnSynonyms: 
+                - source address
+                - source ip
+              ColumnDataRole: DIMENSION
+              IsIncludedInTopic: true
+            - ColumnName: dstport
+              ColumnFriendlyName: Dstport
+              ColumnSynonyms: 
+                - destination port
+              CellValueSynonyms:
+                - CellValue: 20
+                  Synonyms: 
+                    - ftp 20
+                    - ftp
+                - CellValue: 21
+                  Synonyms: 
+                    - ftp 21
+                - CellValue: 22
+                  Synonyms: 
+                    - ssh
+                - CellValue: 23
+                  Synonyms: 
+                    - telnet
+                - CellValue: 25
+                  Synonyms: 
+                    - smtp
+                - CellValue: 53
+                  Synonyms: 
+                    - dns
+                - CellValue: 80
+                  Synonyms: 
+                    - http
+                - CellValue: 443
+                  Synonyms: 
+                    - https
+                - CellValue: 3389
+                  Synonyms: 
+                    - rdp
+              ColumnDataRole: DIMENSION
+              IsIncludedInTopic: true
+            - ColumnName: srcport
+              ColumnFriendlyName: Srcport
+              ColumnSynonyms: 
+                - source port
+              CellValueSynonyms:
+                - CellValue: 20
+                  Synonyms: 
+                    - ftp 20
+                    - ftp
+                - CellValue: 21
+                  Synonyms: 
+                    - ftp 21
+                - CellValue: 22
+                  Synonyms: 
+                    - ssh
+                - CellValue: 23
+                  Synonyms: 
+                    - telnet
+                - CellValue: 25
+                  Synonyms: 
+                    - smtp
+                - CellValue: 53
+                  Synonyms: 
+                    - dns
+                - CellValue: 80
+                  Synonyms: 
+                    - http
+                - CellValue: 443
+                  Synonyms: 
+                    - https
+                - CellValue: 3389
+                  Synonyms: 
+                    - rdp
+              ColumnDataRole: DIMENSION
+              IsIncludedInTopic: true
+            - ColumnName: start
+              ColumnFriendlyName: Start
+              ColumnDataRole: DIMENSION
+              IsIncludedInTopic: false
+            - ColumnName: end
+              ColumnFriendlyName: End
+              ColumnDataRole: DIMENSION
+              IsIncludedInTopic: false
+            - ColumnName: flow-direction
+              ColumnFriendlyName: Flow Direction
+              ColumnSynonyms: 
+                - in
+                - out
+                - ingress
+                - egress
+              ColumnDataRole: DIMENSION
+              IsIncludedInTopic: true
+            - ColumnName: instance-id
+              ColumnFriendlyName: Instance Id
+              ColumnSynonyms: 
+                - ec2
+                - instance
+              ColumnDataRole: DIMENSION
+              IsIncludedInTopic: true
+            - ColumnName: log-status
+              ColumnFriendlyName: Log Status
+              ColumnDataRole: DIMENSION
+              IsIncludedInTopic: false
+            - ColumnName: packets
+              ColumnFriendlyName: Packets
+              ColumnDataRole: DIMENSION
+              IsIncludedInTopic: true
+            - ColumnName: pkt-dst-aws-service
+              ColumnFriendlyName: Pkt Dst Aws Service
+              ColumnSynonyms: 
+                - destination service
+              ColumnDataRole: DIMENSION
+              IsIncludedInTopic: true
+            - ColumnName: pkt-src-aws-service
+              ColumnFriendlyName: Pkt Src Aws Service
+              ColumnSynonyms: 
+                - source service
+              ColumnDataRole: DIMENSION
+              IsIncludedInTopic: true
+            - ColumnName: pkt-dstaddr
+              ColumnFriendlyName: Pkt Dstaddr
+              ColumnDataRole: DIMENSION
+              IsIncludedInTopic: false
+            - ColumnName: pkt-srcaddr
+              ColumnFriendlyName: Pkt Srcaddr
+              ColumnDataRole: DIMENSION
+              IsIncludedInTopic: false              
+            - ColumnName: protocol
+              ColumnFriendlyName: Protocol
+              CellValueSynonyms:
+                - CellValue: 1
+                  Synonyms: 
+                    - icmp
+                - CellValue: 6
+                  Synonyms: 
+                    - tcp
+                - CellValue: 17
+                  Synonyms: 
+                    - udp
+              ColumnDataRole: DIMENSION
+              IsIncludedInTopic: true              
+            - ColumnName: region
+              ColumnFriendlyName: Region
+              ColumnDataRole: DIMENSION
+              IsIncludedInTopic: true   
+            - ColumnName: sublocation-id
+              ColumnFriendlyName: Sublocation Id
+              ColumnDataRole: DIMENSION
+              IsIncludedInTopic: false
+            - ColumnName: sublocation-type
+              ColumnFriendlyName: Sublocation Type
+              ColumnDataRole: DIMENSION
+              IsIncludedInTopic: false
+            - ColumnName: subnet-id
+              ColumnFriendlyName: Subnet Id
+              ColumnDataRole: DIMENSION
+              ColumnSynonyms: 
+                - subnet
+              IsIncludedInTopic: true
+            - ColumnName: vpc-id
+              ColumnFriendlyName: VPC Id
+              ColumnDataRole: DIMENSION
+              ColumnSynonyms: 
+                - vpc
+                - cidr
+                - network
+              IsIncludedInTopic: true 
+            - ColumnName: tcp-flags
+              ColumnFriendlyName: TCP Flags
+              ColumnDataRole: DIMENSION
+              IsIncludedInTopic: true 
+            - ColumnName: traffic-path
+              ColumnFriendlyName: Traffic Path
+              ColumnDataRole: DIMENSION
+              ColumnSynonyms: 
+                - path
+              CellValueSynonyms:
+                - CellValue: '-'
+                  Synonyms: 
+                    - Other
+                - CellValue: 1
+                  Synonyms: 
+                    - Traffic Same VPC
+                - CellValue: 2
+                  Synonyms: 
+                    - Traffic Via Internet Gateway or Gateway VPC Endpoint
+                - CellValue: 3
+                  Synonyms: 
+                    - Traffic Via Virtual Private Gateway
+                - CellValue: 4
+                  Synonyms: 
+                    - Traffic Via Intra-region VPC Peering
+                - CellValue: 5
+                  Synonyms: 
+                    - Traffic Via Inter-region VPC Peering
+                - CellValue: 6
+                  Synonyms: 
+                    - Traffic Via Local Gateway
+                - CellValue: 7
+                  Synonyms: 
+                    - Traffic Via Gateway VPC Endpoint
+                - CellValue: 8
+                  Synonyms: 
+                    - Traffic Via Internet Gateway
+              IsIncludedInTopic: true 
+            - ColumnName: type
+              ColumnFriendlyName: Type
+              ColumnDataRole: DIMENSION
+              ColumnSynonyms: 
+                - ip version
+              IsIncludedInTopic: true 
+            - ColumnName: version
+              ColumnFriendlyName: Version
+              ColumnDataRole: DIMENSION
+              IsIncludedInTopic: false
+            - ColumnName: security-group-id
+              ColumnFriendlyName: Security Group Id
+              ColumnDataRole: DIMENSION
+              ColumnSynonyms: 
+                - sg
+                - security group
+              IsIncludedInTopic: true
+            - ColumnName: cost-tag
+              ColumnFriendlyName: Cost Tag
+              ColumnSynonyms: 
+                - tag
+              ColumnDataRole: DIMENSION
+              IsIncludedInTopic: true
+  QsDataSchedule:
+    DependsOn:
+      - QsDataSet
+    Type: 'AWS::QuickSight::RefreshSchedule'
+    Properties:
+      AwsAccountId:
+        'Fn::Sub': '${AWS::AccountId}'
+      DataSetId: !Join ['-', [vpcflowlogs-qs-dataset, !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]]]
+      Schedule:
+        RefreshType: FULL_REFRESH
+        ScheduleFrequency:
+          Interval: HOURLY
+          TimeOfTheDay: '23:00'
+          TimeZone: America/Toronto
+        ScheduleId: !Join ['-', [vpcflowlogs-qs-schedule, !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]]]
+  QsDataAnalysis:
+    Type: 'AWS::QuickSight::Analysis'
+    DependsOn:
+      - QsDataSet
+    Properties:
+      Name: vpcflowlogs-analysis
+      AnalysisId: !Join ['-', [vpcflowlogs-qs-analysis, !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]]]
+      AwsAccountId:
+        'Fn::Sub': '${AWS::AccountId}'
+      Definition:
+        AnalysisDefaults:
+          DefaultNewSheetConfiguration:
+            InteractiveLayoutConfiguration:
+              Grid:
+                CanvasSizeOptions:
+                  ScreenCanvasSizeOptions:
+                    OptimizedViewPortWidth: 1600px
+                    ResizeOption: FIXED
+            SheetContentType: INTERACTIVE
+        CalculatedFields: []
+        DataSetIdentifierDeclarations:
+          - DataSetArn: !GetAtt QsDataSet.Arn
+            Identifier: !Join ['-', [vpcflowlogs-qs-dataset, !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]]]
+        FilterGroups: []
+        Options:
+          WeekStart: SUNDAY
+        ParameterDeclarations: []
+        QueryExecutionOptions:
+          QueryExecutionMode: AUTO
+        Sheets:
+        - ContentType: INTERACTIVE
+          Layouts:
+          - Configuration:
+              GridLayout:
+                CanvasSizeOptions:
+                  ScreenCanvasSizeOptions:
+                    OptimizedViewPortWidth: 1600px
+                    ResizeOption: FIXED
+                Elements: []
+          Name: vpcflowlogs-sheet
+          SheetId: !Join ['-', [vpcflowlogs-qs-sheet, !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]]]
+          Visuals: []
+      ValidationStrategy:
+        Mode: LENIENT
+      Permissions:
+      - Principal: !Ref QuicksightUserARN
+        Actions:
+          - quicksight:RestoreAnalysis
+          - quicksight:UpdateAnalysisPermissions
+          - quicksight:DeleteAnalysis
+          - quicksight:QueryAnalysis
+          - quicksight:DescribeAnalysisPermissions
+          - quicksight:DescribeAnalysis
+          - quicksight:UpdateAnalysis
+### Custom resource for Delay (sleep), Required as QSTopic may fail if QsDataSchedule is running
+  QsDataScheduleDelay:
+    Type: 'Custom::Delay'
+    DependsOn: 
+      - QsDataSchedule
+    Properties:
+      ServiceToken: !GetAtt DelayFunction.Arn
+      TimeToWait: 120
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      RoleName: "IAMRoleLambdaDelayer"
+      Policies:
+        - PolicyName: "lambda-logs"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - "arn:aws:logs:*:*:*"
+  DelayFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Handler: "index.handler"
+      Timeout: 180
+      Role: !GetAtt 'LambdaRole.Arn'
+      Runtime: python3.12
+      Code:
+        ZipFile: |
+          import json
+          import cfnresponse
+          import time
+          def handler(event, context):
+            try:
+              time_to_wait = int(event['ResourceProperties']['TimeToWait'])
+              print('wait started')
+              time.sleep(time_to_wait)
+              responseData = {}
+              responseData['Data'] = "wait complete"
+              print("wait completed")
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+            except Exception as e:
+              print("Error: " + str(e))
+              cfnresponse.send(event, context, cfnresponse.FAILED, response_data)

@@ -1,0 +1,960 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Sample Cloudformation Template to create combined dataset for VPC flowlogs + Route 53 resolver logs with QuickSight'
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: The ID of the VPC for which to create the Flow Log
+
+  QuickSightUserArn:
+    Type: String
+    Description: The ARN of the QuickSight user who will own the dataset
+
+  QuicksightServiceRole:
+    Type: String
+    Default: aws-quicksight-service-role-v0
+    Description: The Quicksight Service role attached to QS, Default is aws-quicksight-service-role-v0
+  
+  WorkGroupName:
+    Type: String
+    Description: The name of the Athena workgroup to use
+    Default: 'primary'
+
+  FlowLogsBucketName:
+    Type: String
+    Default: ''
+    Description: The name of the S3 bucket to deliver the VPC Flow Logs. Leave blank to create a new bucket.
+
+  DNSLogsBucketName:
+    Type: String
+    Default: ''
+    Description: The name of the S3 bucket to deliver the Route 53 DNS Query Logs. Leave blank to create a new bucket.
+
+Conditions:
+  CreateFlowLogsBucket: !Equals [ !Ref FlowLogsBucketName, '' ]
+  CreateDNSLogsBucket: !Equals [ !Ref DNSLogsBucketName, '' ]
+
+
+
+Resources:
+  FlowLogsBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateFlowLogsBucket
+    Properties:
+      BucketName: !Sub 'vpc-flow-logs-${AWS::AccountId}-${AWS::Region}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+        - ServerSideEncryptionByDefault:
+            SSEAlgorithm: AES256
+
+  DNSLogsBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateDNSLogsBucket
+    Properties:
+      BucketName: !Sub 'dns-query-logs-${AWS::AccountId}-${AWS::Region}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+        - ServerSideEncryptionByDefault:
+            SSEAlgorithm: AES256
+
+  VPCFlowLog:
+    Type: AWS::EC2::FlowLog
+    Properties:
+      ResourceId: !Ref VpcId
+      ResourceType: VPC
+      TrafficType: ALL
+      LogDestinationType: s3
+      LogDestination: !If
+        - CreateFlowLogsBucket
+        - !GetAtt FlowLogsBucket.Arn
+        - !Sub 'arn:aws:s3:::${FlowLogsBucketName}'
+      LogFormat: '${account-id} ${action} ${az-id} ${bytes} ${dstaddr} ${dstport} ${end} ${flow-direction} ${instance-id} ${interface-id} ${log-status} ${packets} ${pkt-dst-aws-service} ${pkt-dstaddr} ${pkt-src-aws-service} ${pkt-srcaddr} ${protocol} ${region} ${srcaddr} ${srcport} ${start} ${sublocation-id} ${sublocation-type} ${subnet-id} ${tcp-flags} ${traffic-path} ${type} ${version} ${vpc-id}'
+
+
+  Route53QueryLoggingConfig:
+    Type: AWS::Route53Resolver::ResolverQueryLoggingConfig
+    Properties:
+      Name: !Sub 'VPC-${VpcId}-DNS-Query-Logging'
+      DestinationArn: !If
+        - CreateDNSLogsBucket
+        - !GetAtt DNSLogsBucket.Arn
+        - !Sub 'arn:aws:s3:::${DNSLogsBucketName}'
+
+  Route53QueryLoggingConfigAssociation:
+    Type: AWS::Route53Resolver::ResolverQueryLoggingConfigAssociation
+    Properties:
+      ResolverQueryLogConfigId: !Ref Route53QueryLoggingConfig
+      ResourceId: !Ref VpcId
+  
+  AthenaVPCNamedQuery:
+    DependsOn: VPCFlowLog
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Database: "default"
+      Description: "Creates an external table for VPC Flow Logs"
+      Name: "CreateVPCFlowLogsTable"
+      QueryString: !If
+        - CreateFlowLogsBucket
+        - !Sub
+            >
+            CREATE EXTERNAL TABLE `vpcflowlogs`(
+              `account_id` string, 
+              `action` string, 
+              `az_id` string, 
+              `bytes` bigint, 
+              `dstaddr` string, 
+              `dstport` int, 
+              `end` bigint, 
+              `flow_direction` string, 
+              `instance_id` string, 
+              `interface_id` string, 
+              `log_status` string, 
+              `packets` bigint, 
+              `pkt_dst_aws_service` string, 
+              `pkt_dstaddr` string, 
+              `pkt_src_aws_service` string, 
+              `pkt_srcaddr` string, 
+              `protocol` bigint, 
+              `aws_region` string, 
+              `srcaddr` string, 
+              `srcport` int, 
+              `start` bigint, 
+              `sublocation_id` string, 
+              `sublocation_type` string, 
+              `subnet_id` string, 
+              `tcp_flags` int, 
+              `traffic_path` int, 
+              `type` string, 
+              `version` int, 
+              `vpc_id` string)
+            PARTITIONED BY (`date` string) 
+            ROW FORMAT DELIMITED 
+              FIELDS TERMINATED BY ' ' 
+            STORED AS INPUTFORMAT 
+              'org.apache.hadoop.mapred.TextInputFormat' 
+            OUTPUTFORMAT 
+              'org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat'
+            LOCATION 's3://${FlowLogsBucket}/AWSLogs/${AWS::AccountId}/vpcflowlogs/${AWS::Region}/' 
+            TBLPROPERTIES ( 
+                'projection.date.format' = 'yyyy/MM/dd',
+                'projection.date.range' = '2021/01/01,NOW',
+                'projection.date.type' = 'date',
+                'projection.date.interval.unit' = 'DAYS',
+                'projection.enabled' = 'true',
+                'skip.header.line.count' = '1',
+                'storage.location.template' = 's3://${FlowLogsBucket}/AWSLogs/${AWS::AccountId}/vpcflowlogs/${AWS::Region}/${!date}'
+              )
+        - !Sub
+            >
+            CREATE EXTERNAL TABLE `vpcflowlogs`(
+              `account_id` string, 
+              `action` string, 
+              `az_id` string, 
+              `bytes` bigint, 
+              `dstaddr` string, 
+              `dstport` int, 
+              `end` bigint, 
+              `flow_direction` string, 
+              `instance_id` string, 
+              `interface_id` string, 
+              `log_status` string, 
+              `packets` bigint, 
+              `pkt_dst_aws_service` string, 
+              `pkt_dstaddr` string, 
+              `pkt_src_aws_service` string, 
+              `pkt_srcaddr` string, 
+              `protocol` bigint, 
+              `aws_region` string, 
+              `srcaddr` string, 
+              `srcport` int, 
+              `start` bigint, 
+              `sublocation_id` string, 
+              `sublocation_type` string, 
+              `subnet_id` string, 
+              `tcp_flags` int, 
+              `traffic_path` int, 
+              `type` string, 
+              `version` int, 
+              `vpc_id` string)
+            PARTITIONED BY (`date` string) 
+            ROW FORMAT DELIMITED 
+              FIELDS TERMINATED BY ' ' 
+            STORED AS INPUTFORMAT 
+              'org.apache.hadoop.mapred.TextInputFormat' 
+            OUTPUTFORMAT 
+              'org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat'
+            LOCATION 's3://${FlowLogsBucketName}/AWSLogs/${AWS::AccountId}/vpcflowlogs/${AWS::Region}/' 
+            TBLPROPERTIES ( 
+                'projection.date.format' = 'yyyy/MM/dd',
+                'projection.date.range' = '2021/01/01,NOW',
+                'projection.date.type' = 'date',
+                'projection.date.interval.unit' = 'DAYS',
+                'projection.enabled' = 'true',
+                'skip.header.line.count' = '1',
+                'storage.location.template' = 's3://${FlowLogsBucketName}/AWSLogs/${AWS::AccountId}/vpcflowlogs/${AWS::Region}/${!date}'
+            )
+      WorkGroup: !Ref WorkGroupName
+
+
+  AthenaDNSNamedQuery:
+    DependsOn: Route53QueryLoggingConfig
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Database: "default"
+      Description: "Creates an external table for DNS Logging"
+      Name: "CreateDNSLogsTable"
+      QueryString: !If
+        - CreateDNSLogsBucket
+        - !Sub
+            >
+            CREATE EXTERNAL TABLE `dnsquerylogs` (
+              version string,
+              account_id string,
+              region string,
+              vpc_id string,
+              query_timestamp string,
+              query_name string,
+              query_type string,
+              query_class string,
+              rcode string,
+              answers array<
+                struct<
+                  Rdata: string,
+                  Type: string,
+                  Class: string>
+                >,
+              srcaddr string,
+              srcport int,
+              transport string,
+              srcids struct<
+                instance: string,
+                resolver_endpoint: string
+                >,
+              firewall_rule_action string,
+              firewall_rule_group_id string,
+              firewall_domain_list_id string)
+              PARTITIONED BY (
+              `date` string
+              )
+              ROW FORMAT SERDE      'org.openx.data.jsonserde.JsonSerDe'
+              STORED AS INPUTFORMAT 'org.apache.hadoop.mapred.TextInputFormat'
+              OUTPUTFORMAT          'org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat'
+              LOCATION              's3://${DNSLogsBucket}/AWSLogs/${AWS::AccountId}/vpcdnsquerylogs/${VpcId}/'
+            TBLPROPERTIES(
+            'projection.enabled' = 'true',
+            'projection.date.type' = 'date',
+            'projection.date.range' = '2023/06/26,NOW',
+            'projection.date.format' = 'yyyy/MM/dd',
+            'projection.date.interval' = '1',
+            'projection.date.interval.unit' = 'DAYS',
+            'storage.location.template' = 's3://${DNSLogsBucket}/AWSLogs/${AWS::AccountId}/vpcdnsquerylogs/${VpcId}/${!date}/'
+            )
+        - !Sub
+            >
+            CREATE EXTERNAL TABLE `dnsquerylogs` (
+              version string,
+              account_id string,
+              region string,
+              vpc_id string,
+              query_timestamp string,
+              query_name string,
+              query_type string,
+              query_class string,
+              rcode string,
+              answers array<
+                struct<
+                  Rdata: string,
+                  Type: string,
+                  Class: string>
+                >,
+              srcaddr string,
+              srcport int,
+              transport string,
+              srcids struct<
+                instance: string,
+                resolver_endpoint: string
+                >,
+              firewall_rule_action string,
+              firewall_rule_group_id string,
+              firewall_domain_list_id string)
+              PARTITIONED BY (
+              `date` string
+              )
+              ROW FORMAT SERDE      'org.openx.data.jsonserde.JsonSerDe'
+              STORED AS INPUTFORMAT 'org.apache.hadoop.mapred.TextInputFormat'
+              OUTPUTFORMAT          'org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat'
+              LOCATION              's3://${DNSLogsBucketName}/AWSLogs/${AWS::AccountId}/vpcdnsquerylogs/${VpcId}/'
+            TBLPROPERTIES(
+            'projection.enabled' = 'true',
+            'projection.date.type' = 'date',
+            'projection.date.range' = '2023/06/26,NOW',
+            'projection.date.format' = 'yyyy/MM/dd',
+            'projection.date.interval' = '1',
+            'projection.date.interval.unit' = 'DAYS',
+            'storage.location.template' = 's3://${DNSLogsBucketName}/AWSLogs/${AWS::AccountId}/vpcdnsquerylogs/${VpcId}/${!date}/'
+            )
+      WorkGroup: !Ref WorkGroupName  
+
+
+  AthenaViewNamedQuery:
+    Type: AWS::Athena::NamedQuery
+    DependsOn: 
+      - AthenaVPCNamedQuery
+      - AthenaDNSNamedQuery
+    Properties:
+      Database: "default"
+      Description: "Creates view combining VPC logs table with DNS logs table"
+      Name: "CreateViewTable"
+      QueryString: 
+            >
+            CREATE OR REPLACE VIEW "vpc_flowlogs_with_dns_query" AS 
+            WITH
+              cte AS (
+              SELECT *
+              FROM
+                (
+                  SELECT
+                    account_id
+                  , vpc_id
+                  , query_name
+                  , answers
+                  , answer.Rdata ip_address
+                  , date
+                  , ROW_NUMBER() OVER (PARTITION BY query_name, answer.Rdata, date ORDER BY account_id ASC) rn
+                  FROM
+                    (default.dnsquerylogs
+                  CROSS JOIN UNNEST(dnsquerylogs.answers) st (answer))
+              )  t
+              WHERE (rn = 1)
+            ) 
+            SELECT
+              t1.*
+            , cte.query_name
+            FROM
+              (vpcflowlogs t1
+            INNER JOIN cte ON ((t1.srcaddr = cte.ip_address) AND (t1.date = cte.date)))
+
+  AthenaQueryExecutor:
+      Type: AWS::Lambda::Function
+      DependsOn: 
+        - AthenaVPCNamedQuery
+        - AthenaDNSNamedQuery
+        - AthenaViewNamedQuery
+      Properties:
+        Code:
+          ZipFile: |
+            import boto3
+            import cfnresponse
+            import os
+            import time
+  
+            def execute_query(athena_client, query_id):
+                named_query = athena_client.get_named_query(NamedQueryId=query_id)
+                query_string = named_query['NamedQuery']['QueryString']
+                
+                response = athena_client.start_query_execution(
+                    QueryString=query_string,
+                    WorkGroup= os.environ['WORKGROUP_NAME']
+                )
+                return response['QueryExecutionId']
+  
+            def lambda_handler(event, context):
+              athena_client = boto3.client('athena')
+              query_ids = event['ResourceProperties']['QueryIds']
+              results = []
+  
+              try:
+                  for query_id in query_ids:
+                      execution_id = execute_query(athena_client, query_id)
+                      results.append(f"Query {query_id} execution started: {execution_id}")
+                      time.sleep(5)  # 5 second delay between queries
+                  
+                  response_data = {
+                      'ExecutionResults': results
+                  }
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data, "All queries executed successfully")
+              except Exception as e:
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {}, str(e))
+  
+        Handler: index.lambda_handler
+        Environment:
+          Variables:
+            WORKGROUP_NAME: !Ref WorkGroupName
+        Runtime: python3.9
+        Timeout: 60
+        Role: !GetAtt LambdaExecutionRole.Arn
+  
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AmazonAthenaFullAccess
+
+  ExecuteQueries:
+    Type: Custom::ExecuteNamedQuery
+    Properties:
+      ServiceToken: !GetAtt AthenaQueryExecutor.Arn
+      QueryIds: 
+        - !Ref AthenaVPCNamedQuery
+        - !Ref AthenaDNSNamedQuery
+        - !Ref AthenaViewNamedQuery
+
+  QuickSightServiceRole:
+    DependsOn: ExecuteQueries
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: "Grants Amazon QuickSight access to Athena and the VPC Flowlogs S3 Bucket "
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - athena:BatchGetQueryExecution
+              - athena:CancelQueryExecution
+              - athena:GetQueryExecution
+              - athena:GetQueryResults
+              - athena:StartQueryExecution
+              - athena:StopQueryExecution
+              - athena:ListWorkGroups
+              - athena:GetWorkGroup
+            Resource: '*'
+          - Effect: Allow
+            Action:
+              - glue:GetTable
+              - glue:GetTables
+              - glue:GetDatabase
+              - glue:GetDatabases
+            Resource: '*'
+          - Effect: Allow
+            Action:
+              - s3:GetBucketLocation
+              - s3:GetObject
+              - s3:ListBucket
+              - s3:ListBucketMultipartUploads
+              - s3:ListMultipartUploadParts
+              - s3:AbortMultipartUpload
+              - s3:PutObject
+            Resource: 
+              - arn:aws:s3:::aws-athena-query-results-*
+              - arn:aws:s3:::aws-athena-query-results-*/*
+              - !If
+                - CreateFlowLogsBucket
+                - !GetAtt FlowLogsBucket.Arn
+                - !Sub 'arn:aws:s3:::${FlowLogsBucketName}'
+              - !If
+                - CreateFlowLogsBucket
+                - !Sub '${FlowLogsBucket.Arn}/*'
+                - !Sub 'arn:aws:s3:::${FlowLogsBucketName}/*'
+              - !If
+                - CreateDNSLogsBucket
+                - !GetAtt DNSLogsBucket.Arn
+                - !Sub 'arn:aws:s3:::${DNSLogsBucketName}'
+              - !If
+                - CreateDNSLogsBucket
+                - !Sub '${DNSLogsBucket.Arn}/*'
+                - !Sub 'arn:aws:s3:::${DNSLogsBucketName}/*'
+      Roles: 
+        - !Ref QuicksightServiceRole
+               
+
+  QuickSightDataSource:
+    DependsOn: ExecuteQueries
+    Type: AWS::QuickSight::DataSource
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      DataSourceId: !Sub 'vpc_flowlogs_with_dns_query-${AWS::Region}'
+      Name: 'vpc_flowlogs_with_dns_query'
+      Type: ATHENA
+      DataSourceParameters:
+        AthenaParameters:
+          WorkGroup: !Ref WorkGroupName
+      Permissions: 
+        - Actions:
+            - "quicksight:UpdateDataSourcePermissions"
+            - "quicksight:DescribeDataSource"
+            - "quicksight:DescribeDataSourcePermissions"
+            - "quicksight:PassDataSource"
+            - "quicksight:UpdateDataSource"
+            - "quicksight:DeleteDataSource"
+          Principal: !Ref QuickSightUserArn
+
+  QuickSightDataSet:
+    DependsOn: QuickSightDataSource
+    Type: AWS::QuickSight::DataSet
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      DataSetId: !Sub 'vpc_flowlogs_with_dns_query_dataset-${AWS::Region}'
+      Name: 'vpc_flowlogs_with_dns_query_dataset'
+      LogicalTableMap:
+        vpcflowlogs-qs-tablemap:
+          Alias: "vpcflowlogs-qs-tablemap-alias"
+          DataTransforms:
+            - CreateColumnsOperation:
+                Columns:
+                  - ColumnName: "Gigabytes"
+                    ColumnId: "BytesInGB"
+                    Expression: 'round(({bytes}/1000/1000/1000), 2)'
+                  - ColumnName: "Megabytes"
+                    ColumnId: "BytesInMB"
+                    Expression: 'round(({bytes}/1000/1000), 2)'
+                  - ColumnName: "Start_DateTime"
+                    ColumnId: "start_DateTime"
+                    Expression: 'epochDate(start)'
+                  - ColumnName: "End_DateTime"
+                    ColumnId: "End_DateTime"
+                    Expression: 'epochDate(end)'
+            - ProjectOperation:
+                ProjectedColumns:
+                  - account_id
+                  - action
+                  - az_id
+                  - bytes
+                  - dstaddr
+                  - dstport
+                  - end
+                  - flow_direction
+                  - instance_id
+                  - interface_id
+                  - log_status
+                  - packets
+                  - pkt_dst_aws_service
+                  - pkt_dstaddr
+                  - pkt_src_aws_service
+                  - pkt_srcaddr
+                  - protocol
+                  - aws_region
+                  - srcaddr
+                  - srcport
+                  - start
+                  - sublocation_id
+                  - sublocation_type
+                  - subnet_id
+                  - tcp_flags
+                  - traffic_path
+                  - type
+                  - version
+                  - vpc_id
+                  - date
+                  - query_name
+                  - Gigabytes
+                  - Megabytes
+                  - Start_DateTime
+                  - End_DateTime
+          Source:
+            PhysicalTableId: vpcflowlogs-qs-physicaltable  
+      PhysicalTableMap:
+        vpcflowlogs-qs-physicaltable:
+          RelationalTable:
+            DataSourceArn: !GetAtt QuickSightDataSource.Arn
+            Schema: "Default"
+            Name: "vpc_flowlogs_with_dns_query"
+            InputColumns:
+              - Name: account_id
+                Type: STRING
+              - Name: action
+                Type: STRING
+              - Name: az_id
+                Type: STRING
+              - Name: bytes
+                Type: INTEGER
+              - Name: dstaddr
+                Type: STRING
+              - Name: dstport
+                Type: INTEGER
+              - Name: end
+                Type: INTEGER
+              - Name: flow_direction
+                Type: STRING
+              - Name: instance_id
+                Type: STRING
+              - Name: interface_id
+                Type: STRING
+              - Name: log_status
+                Type: STRING
+              - Name: packets
+                Type: INTEGER
+              - Name: pkt_dst_aws_service
+                Type: STRING
+              - Name: pkt_dstaddr
+                Type: STRING
+              - Name: pkt_src_aws_service
+                Type: STRING
+              - Name: pkt_srcaddr
+                Type: STRING
+              - Name: protocol
+                Type: INTEGER
+              - Name: aws_region
+                Type: STRING
+              - Name: srcaddr
+                Type: STRING
+              - Name: srcport
+                Type: INTEGER
+              - Name: start
+                Type: INTEGER
+              - Name: sublocation_id
+                Type: STRING
+              - Name: sublocation_type
+                Type: STRING
+              - Name: subnet_id
+                Type: STRING
+              - Name: tcp_flags
+                Type: INTEGER
+              - Name: traffic_path
+                Type: INTEGER
+              - Name: type
+                Type: STRING
+              - Name: version
+                Type: INTEGER
+              - Name: vpc_id
+                Type: STRING
+              - Name: date
+                Type: STRING
+              - Name: query_name
+                Type: STRING 
+
+      ImportMode: SPICE
+      DataSetUsageConfiguration:
+        DisableUseAsDirectQuerySource: false
+        DisableUseAsImportedSource: false
+      Permissions:
+        - Principal: !Ref QuickSightUserArn
+          Actions: 
+            - "quicksight:DeleteDataSet"
+            - "quicksight:CreateIngestion"
+            - "quicksight:CancelIngestion"
+            - "quicksight:DescribeDataSet"
+            - "quicksight:DescribeDataSetPermissions"
+            - "quicksight:PassDataSet"
+            - "quicksight:DescribeIngestion"
+            - "quicksight:ListIngestions"
+            - "quicksight:UpdateDataSetPermissions"
+            - "quicksight:UpdateDataSet"
+
+  QuickSightDataAnalysis:
+    Type: 'AWS::QuickSight::Analysis'
+    DependsOn:
+      - QuickSightDataSet
+    Properties:
+      Name: vpcflowlogsplusdns-analysis
+      AnalysisId: !Sub 'vpcflowlogsplusdns-analysis-${AWS::Region}'
+      AwsAccountId:
+        'Fn::Sub': '${AWS::AccountId}'
+      Definition:
+        AnalysisDefaults:
+          DefaultNewSheetConfiguration:
+            InteractiveLayoutConfiguration:
+              Grid:
+                CanvasSizeOptions:
+                  ScreenCanvasSizeOptions:
+                    OptimizedViewPortWidth: 1600px
+                    ResizeOption: FIXED
+            SheetContentType: INTERACTIVE
+        CalculatedFields: []
+        DataSetIdentifierDeclarations:
+          - DataSetArn: !GetAtt QuickSightDataSet.Arn
+            Identifier: !Sub 'vpc_flowlogs_with_dns_query_dataset-${AWS::Region}'
+        FilterGroups: []
+        Options:
+          WeekStart: SUNDAY
+        ParameterDeclarations: []
+        QueryExecutionOptions:
+          QueryExecutionMode: AUTO
+        Sheets:
+        - ContentType: INTERACTIVE
+          Layouts:
+          - Configuration:
+              GridLayout:
+                CanvasSizeOptions:
+                  ScreenCanvasSizeOptions:
+                    OptimizedViewPortWidth: 1600px
+                    ResizeOption: FIXED
+                Elements: []
+          Name: vpcflowlogs-sheet
+          SheetId: !Sub 'vpcflowlogs-sheet-${AWS::Region}'
+          Visuals: []
+      ValidationStrategy:
+        Mode: LENIENT
+      Permissions:
+      - Principal: !Ref QuickSightUserArn
+        Actions:
+          - quicksight:RestoreAnalysis
+          - quicksight:UpdateAnalysisPermissions
+          - quicksight:DeleteAnalysis
+          - quicksight:QueryAnalysis
+          - quicksight:DescribeAnalysisPermissions
+          - quicksight:DescribeAnalysis
+          - quicksight:UpdateAnalysis
+
+  QuickSightTopic:
+    Type: 'AWS::QuickSight::Topic'
+    DependsOn:
+      - QuickSightDataSet
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      Name: vpcflowlogsplusdns-topic
+      Description: "Quicksight Topic Containing Synonyms"
+      TopicId: vpcflowlogsplusdns-topic
+      UserExperienceVersion: NEW_READER_EXPERIENCE
+      DataSets: 
+        - DatasetArn: !GetAtt QuickSightDataSet.Arn
+          DatasetName: 'vpc_flowlogs_with_dns_query_dataset'
+          Columns: 
+            - ColumnName: Gigabytes
+              ColumnFriendlyName: Gigabytes
+              ColumnSynonyms: 
+                - gb
+                - data
+                - traffic
+              ColumnDataRole: MEASURE
+              IsIncludedInTopic: true
+            - ColumnName: Megabytes
+              ColumnFriendlyName: Megabytes
+              ColumnSynonyms: 
+                - mb
+                - data
+                - traffic
+              ColumnDataRole: MEASURE
+              IsIncludedInTopic: true
+            - ColumnName: Start_DateTime
+              ColumnFriendlyName: Start Date_Time
+              ColumnDataRole: MEASURE
+              IsIncludedInTopic: True
+            - ColumnName: End_DateTime
+              ColumnFriendlyName: End Date_Time
+              ColumnDataRole: MEASURE
+              IsIncludedInTopic: True
+            - ColumnName: account_id
+              ColumnFriendlyName: Account Id
+              ColumnSynonyms: 
+                - account
+                - account number
+              ColumnDataRole: DIMENSION
+              IsIncludedInTopic: true
+            - ColumnName: action
+              ColumnFriendlyName: Action
+              ColumnSynonyms: 
+                - traffic action
+              ColumnDataRole: DIMENSION
+              IsIncludedInTopic: true
+            - ColumnName: az_id
+              ColumnFriendlyName: AZ-Id
+              ColumnSynonyms: 
+                - az
+                - availability zone
+              ColumnDataRole: DIMENSION
+              IsIncludedInTopic: true
+            - ColumnName: bytes
+              ColumnFriendlyName: Bytes
+              ColumnSynonyms: 
+                - data
+                - traffic
+              ColumnDataRole: MEASURE
+              IsIncludedInTopic: true
+            - ColumnName: dstaddr
+              ColumnFriendlyName: Dstaddr
+              ColumnSynonyms: 
+                - destination address
+                - destination ip
+              ColumnDataRole: DIMENSION
+              IsIncludedInTopic: true
+            - ColumnName: dstport
+              ColumnFriendlyName: Dstport
+              ColumnSynonyms: 
+                - destination port
+              ColumnDataRole: DIMENSION
+              IsIncludedInTopic: true
+            - ColumnName: end
+              ColumnFriendlyName: End Time Unix
+              ColumnDataRole: DIMENSION
+              IsIncludedInTopic: True
+            - ColumnName: flow_direction
+              ColumnFriendlyName: Flow Direction
+              ColumnSynonyms: 
+                - in
+                - out
+                - ingress
+                - egress
+              ColumnDataRole: DIMENSION
+              IsIncludedInTopic: true
+            - ColumnName: instance_id
+              ColumnFriendlyName: Instance Id
+              ColumnSynonyms: 
+                - ec2
+                - instance
+              ColumnDataRole: DIMENSION
+              IsIncludedInTopic: true
+            - ColumnName: interface_id
+              ColumnFriendlyName: Interface Id
+              ColumnSynonyms: 
+                - ENI Id
+                - eni Id
+              ColumnDataRole: DIMENSION
+              IsIncludedInTopic: true
+            - ColumnName: log_status
+              ColumnFriendlyName: Log Status
+              ColumnDataRole: DIMENSION
+              IsIncludedInTopic: true
+            - ColumnName: packets
+              ColumnFriendlyName: Packets
+              ColumnDataRole: MEASURE
+              IsIncludedInTopic: true
+            - ColumnName: pkt_dst_aws_service
+              ColumnFriendlyName: Pkt Dst Aws Service
+              ColumnSynonyms: 
+                - destination service
+              ColumnDataRole: DIMENSION
+              IsIncludedInTopic: true
+            - ColumnName: pkt_dstaddr
+              ColumnFriendlyName: Pkt Dstaddr
+              ColumnDataRole: DIMENSION
+              IsIncludedInTopic: true
+            - ColumnName: pkt_src_aws_service
+              ColumnFriendlyName: Pkt Src Aws Service
+              ColumnSynonyms: 
+                - source service
+              ColumnDataRole: DIMENSION
+              IsIncludedInTopic: true
+            - ColumnName: pkt_srcaddr
+              ColumnFriendlyName: Pkt Srcaddr
+              ColumnDataRole: DIMENSION
+              IsIncludedInTopic: true
+            - ColumnName: protocol
+              ColumnFriendlyName: Protocol
+              ColumnDataRole: DIMENSION
+              IsIncludedInTopic: true 
+            - ColumnName: aws_region
+              ColumnFriendlyName: AWS Region
+              ColumnDataRole: DIMENSION
+              IsIncludedInTopic: true
+            - ColumnName: srcaddr
+              ColumnFriendlyName: Srcaddr
+              ColumnSynonyms: 
+                - source address
+                - source ip
+              ColumnDataRole: DIMENSION
+              IsIncludedInTopic: true
+            - ColumnName: srcport
+              ColumnFriendlyName: Srcport
+              ColumnSynonyms: 
+                - source port
+              ColumnDataRole: DIMENSION
+              IsIncludedInTopic: true
+            - ColumnName: start
+              ColumnFriendlyName: Start Time Unix
+              ColumnDataRole: DIMENSION
+              IsIncludedInTopic: true
+            - ColumnName: sublocation_id
+              ColumnFriendlyName: Sublocation Id
+              ColumnDataRole: DIMENSION
+              IsIncludedInTopic: false
+            - ColumnName: sublocation_type
+              ColumnFriendlyName: Sublocation Type
+              ColumnDataRole: DIMENSION
+              IsIncludedInTopic: false
+            - ColumnName: subnet_id
+              ColumnFriendlyName: Subnet Id
+              ColumnDataRole: DIMENSION
+              ColumnSynonyms: 
+                - subnet
+              IsIncludedInTopic: true
+            - ColumnName: tcp_flags
+              ColumnFriendlyName: TCP Flags
+              ColumnDataRole: DIMENSION
+              IsIncludedInTopic: true 
+            - ColumnName: traffic_path
+              ColumnFriendlyName: Traffic Path
+              ColumnSynonyms: 
+                - path
+              ColumnDataRole: DIMENSION
+              IsIncludedInTopic: true 
+            - ColumnName: type
+              ColumnFriendlyName: Type
+              ColumnDataRole: DIMENSION
+              ColumnSynonyms: 
+                - ip version
+              IsIncludedInTopic: true
+            - ColumnName: version
+              ColumnFriendlyName: Version
+              ColumnDataRole: DIMENSION
+              IsIncludedInTopic: false
+            - ColumnName: vpc_id
+              ColumnFriendlyName: VPC Id
+              ColumnDataRole: DIMENSION
+              ColumnSynonyms: 
+                - vpc
+                - cidr
+                - network
+              IsIncludedInTopic: true 
+            - ColumnName: date
+              ColumnFriendlyName: Date
+              ColumnDataRole: DIMENSION
+              IsIncludedInTopic: true 
+            - ColumnName: query_name
+              ColumnFriendlyName: Query Name
+              ColumnDataRole: DIMENSION
+              ColumnSynonyms: 
+                - DNS Name
+                - Domain Name
+              IsIncludedInTopic: true 
+
+  QuickSightDataSchedule:
+    DependsOn: QuickSightTopic
+    Type: 'AWS::QuickSight::RefreshSchedule'
+    Properties:
+      AwsAccountId:
+        'Fn::Sub': '${AWS::AccountId}'
+      DataSetId: !Sub 'vpc_flowlogs_with_dns_query_dataset-${AWS::Region}'
+      Schedule:
+        RefreshType: FULL_REFRESH
+        ScheduleFrequency:
+          Interval: HOURLY
+          TimeOfTheDay: '23:00'
+          TimeZone: America/New_York
+        ScheduleId: !Sub 'vpcflowlogs-qs-schedule-${AWS::Region}'
+
+Outputs:
+  VPCNamedQueryId:
+    Description: 'The ID of the created Athena Named Query'
+    Value: !Ref AthenaVPCNamedQuery
+  R53LogsQueryId:
+    Description: 'The ID of the created Athena Named Query for R53 Logs'
+    Value: !Ref AthenaDNSNamedQuery
+  FlowLogId:
+    Description: The ID of the VPC Flow Log
+    Value: !Ref VPCFlowLog
+  FlowLogsBucketArn:
+    Description: The ARN of the S3 bucket for Flow Logs
+    Value: !If
+      - CreateFlowLogsBucket
+      - !GetAtt FlowLogsBucket.Arn
+      - !Sub 'arn:aws:s3:::${FlowLogsBucketName}'
+  DNSLogsBucketArn:
+    Description: The ARN of the S3 bucket for Route 53 DNS Query Logs
+    Value: !If
+      - CreateDNSLogsBucket
+      - !GetAtt DNSLogsBucket.Arn
+      - !Sub 'arn:aws:s3:::${DNSLogsBucketName}'
+  Route53QueryLoggingConfigId:
+    Description: The ID of the Route 53 Query Logging Configuration
+    Value: !Ref Route53QueryLoggingConfig
+
