@@ -87,7 +87,7 @@ Download the `qs-vpcflow-logs-cfn.yaml` file from the repository to your local m
 >
 > The user working on the analysis must have a **PRO** role. If the user does not have a **PRO** role, QuickSight will hide the **Build visual** button. For more information see [Managing user access inside Amazon QuickSight](https://docs.aws.amazon.com/quicksight/latest/user/managing-users.html) and [How to update my user in Amazon QuickSight to ADMIN PRO?](https://repost.aws/articles/ARLexnrP0DSLKU7ZBPB6jTgQ/how-to-update-my-user-in-amazon-quicksight-to-admin-pro).
 
-### Step 8: Begin Populating the Analysis with Visuals
+### Step 10: Begin Populating the Analysis with Visuals
 1. On the centre of the top bar, click **Build visual**. The Build a visual right pane will be revealed. Begin by typing the first natural language question. In the next section we provide 4 sample questions to get you started. The QuickSight documentation provider [types of questions supported by Q](https://docs.aws.amazon.com/quicksight/latest/user/quicksight-q-ask.html#quicksight-q-ask-types) with more sample questions.
 2. Amazon Q will interpret the questions and derive a query based on the field from the dataset and the defined synonyms in the linked topic. Amazon Q will also select a visual type, this can be changed. On the top right of the visual, click on the image of a bar graph and select the visual type that best visually represents the data for you. Click **ADD TO ANALYSIS**
 
