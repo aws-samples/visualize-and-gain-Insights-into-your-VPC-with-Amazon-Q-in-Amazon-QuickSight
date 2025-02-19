@@ -16,14 +16,16 @@ Below is the architecture diagram that illustrates the components and flow of da
 
 ![Architecture Diagram](images/vpc-flowlogs-architecture.png)
 
-1. **VPC Flow Logs**: Flow logs are enabled for your VPC and sent to CloudWatch Logs.
-2. **Amazon Firehose**: Streams the VPC flow logs to S3 via a Lambda.
-3. **AWS Lambda**: A Lambda function enrich, transform the logs and stores the processed data in an S3 bucket.
-4. **Amazon S3**: Stores the enriched VPC flowlogs data.
-5. **AWS Glue**: Crawls the S3 bucket to catalog the data for querying.
-6. **Amazon Athena**: Queries the cataloged data from AWS Glue.
-7. **Amazon QuickSight**: Visualizes the data stored in S3, providing a comprehensive dashboard for analysis.
-8. **Amazon Q**: Interprets natural language queries to faciliate the development of visuals in the analysis.
+1. VPC Flow Logs are enabled on an existing VPC by the AWS CloudFormation template.
+2. Log records are sent to Data Firehose.
+3. Data Firehose is configured to emit metrics and logs to Amazon CloudWatch for troubleshooting if necessary.
+4. Data Firehose invokes a Lambda to enrich the VPC Flow Logs with more attributes, such as Amazon EC2 security group and cost tag.
+5. Lambda is configured to emit metrics and logs to CloudWatch for troubleshooting if necessary.
+6. Enriched VPC Flow Logs are delivered to an S3 bucket.
+7. AWS Glue crawls the S3 bucket to catalog the data for querying.
+8. Athena queries the cataloged data from AWS Glue.
+9. QuickSight uses Athena and Amazon S3 as a data source for the dataset. A blank analysis is created ready to begin visualizing the VPC Flow Logs.
+10. Amazon Q is enabled on the analysis through a Q topic. The Q topic allows Quicksight to interpret natural language queries to facilitate the development of visuals in the analysis.
 
 
 ## Prerequisites
