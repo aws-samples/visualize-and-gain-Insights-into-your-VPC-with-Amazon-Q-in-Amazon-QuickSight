@@ -1,0 +1,3235 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Network Firewall, One Production/Inspection VPCs (six EC2 instances). All instances use SSM (via IAM Instance Profile) for access.
+  This template includes complete UserData scripts for all instances.
+
+Parameters:
+  InstanceType:
+    Type: String
+    Default: 't3.micro'
+  FirewallName:
+    Type: String
+    Description: Name of the network firewall (used in both firewall and dashboard)
+    Default: 'CentralizedFirewall'
+  ContributorInsightsRuleState:
+        Type: String
+        Description: Choose to enable or disable the Contributor Insight rules created by this template
+        Default: ENABLED
+        AllowedValues:
+          - ENABLED
+          - DISABLED
+  FirewallAlertLogGroupName:
+    Type: String
+    Description: Name of the Firewall Alert Log Group
+    Default: '/aws/network-firewall/alert'
+  
+  FirewallFlowLogGroupName:
+    Type: String
+    Description: Name of the Firewall Flow Log Group
+    Default: '/aws/network-firewall/flow'
+
+Resources:
+
+  # ------------------------------
+  # Inspection VPC & Subnets
+  # ------------------------------
+  InspectionVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: '10.0.0.0/16'
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: InspectionVPC
+
+  # Public subnets for NAT
+  InspectionPublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref InspectionVPC
+      CidrBlock: '10.0.7.0/24'
+      AvailabilityZone: !Select [0, !GetAZs ""] 
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: InspectionPublicSubnet1
+
+  InspectionPublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref InspectionVPC
+      CidrBlock: '10.0.8.0/24'
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: InspectionPublicSubnet2
+
+
+  # Firewall subnets
+  FirewallSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref InspectionVPC
+      CidrBlock: '10.0.3.0/24'
+      AvailabilityZone: !Select [0, !GetAZs ""] 
+      Tags:
+        - Key: Name
+          Value: FirewallSubnet1
+
+  FirewallSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref InspectionVPC
+      CidrBlock: '10.0.4.0/24'
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: FirewallSubnet2
+
+    # Instance attachment subnets
+  WorkloadSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref InspectionVPC
+      CidrBlock: '10.0.5.0/24'
+      AvailabilityZone: !Select [0, !GetAZs ""] 
+      Tags:
+        - Key: Name
+          Value: WorkloadSubnet1
+
+  WorkloadSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref InspectionVPC
+      CidrBlock: '10.0.6.0/24'
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: WorkloadSubnet2
+
+
+  # Internet Gateway and NAT gateways
+  InspectionIGW:
+    Type: AWS::EC2::InternetGateway
+
+  AttachInspectionIGW:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref InspectionVPC
+      InternetGatewayId: !Ref InspectionIGW
+
+  InspectionEIP1:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  InspectionEIP2:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  InspectionNATGW1:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt InspectionEIP1.AllocationId
+      SubnetId: !Ref InspectionPublicSubnet1
+
+  InspectionNATGW2:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt InspectionEIP2.AllocationId
+      SubnetId: !Ref InspectionPublicSubnet2
+
+  # ------------------------------
+  # Route Tables & Routes
+  # ------------------------------
+
+  ## Firewall route table
+  InspectionRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref InspectionVPC
+
+  InspectionRouteToNAT1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref InspectionRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref InspectionNATGW1
+
+
+
+  ## Public route table
+  InspectionPublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref InspectionVPC
+
+  # 0.0.0.0/0 → Internet
+  InspectionPublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: [AttachInspectionIGW]
+    Properties:
+      RouteTableId: !Ref InspectionPublicRouteTable
+      DestinationCidrBlock: '0.0.0.0/0'
+      GatewayId: !Ref InspectionIGW
+
+    # Workload CIDRs 
+
+  InspectionPublicRouteToWorkloadSubnet1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref InspectionPublicRouteTable
+      DestinationCidrBlock: '10.0.5.0/24'
+      VpcEndpointId: !Select
+        - 1
+        - !Split
+          - ":"
+          - !Select [0, !GetAtt NetworkFirewall.EndpointIds]
+
+  InspectionPublicRouteToWorkloadSubnet2:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref InspectionPublicRouteTable
+      DestinationCidrBlock: '10.0.6.0/24'
+      VpcEndpointId: !Select
+        - 1
+        - !Split
+          - ":"
+          - !Select [0, !GetAtt NetworkFirewall.EndpointIds]
+
+    # ------------------------------
+  # Workload VPC Instance Route Tables & Routes
+  # ------------------------------
+  WorkloadInstanceRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref InspectionVPC
+
+  WorkloadVPCDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref WorkloadInstanceRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      VpcEndpointId: !Select
+        - 1
+        - !Split
+          - ":"
+          - !Select [0, !GetAtt NetworkFirewall.EndpointIds]
+
+  WorkloadSubnet1Association:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref WorkloadSubnet1
+      RouteTableId: !Ref WorkloadInstanceRouteTable
+
+  WorkloadSubnet2Association:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref WorkloadSubnet2
+      RouteTableId: !Ref WorkloadInstanceRouteTable
+
+  # ------------------------------
+  # Subnet Associations
+  # ------------------------------
+
+  # Firewall subnets → InspectionRouteTable
+  FirewallSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref FirewallSubnet1
+      RouteTableId: !Ref InspectionRouteTable
+
+  FirewallSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref FirewallSubnet2
+      RouteTableId: !Ref InspectionRouteTable
+
+  # Public subnets → InspectionPublicRouteTable
+  InspectionPublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref InspectionPublicSubnet1
+      RouteTableId: !Ref InspectionPublicRouteTable
+
+  InspectionPublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref InspectionPublicSubnet2
+      RouteTableId: !Ref InspectionPublicRouteTable
+
+
+  # ------------------------------
+  # Network Firewall & Logging
+  # ------------------------------
+  NetworkFirewall:
+    Type: AWS::NetworkFirewall::Firewall
+    Properties:
+      FirewallName: !Ref FirewallName
+      FirewallPolicyArn: !Ref FirewallPolicy
+      VpcId: !Ref InspectionVPC
+      SubnetMappings:
+        - SubnetId: !Ref FirewallSubnet1
+        - SubnetId: !Ref FirewallSubnet2
+      EnabledAnalysisTypes:
+        - TLS_SNI
+        - HTTP_HOST
+
+  FirewallPolicy:
+    Type: AWS::NetworkFirewall::FirewallPolicy
+    Properties:
+      FirewallPolicyName: 'DemoPolicy'
+      FirewallPolicy:
+        StatelessDefaultActions: ['aws:forward_to_sfe']
+        StatelessFragmentDefaultActions: ['aws:forward_to_sfe']
+        StatefulRuleGroupReferences:
+          - ResourceArn: !Ref SuricataRuleGroup
+            Priority: 100
+          - ResourceArn: !Ref StandardStatefulRuleGroup
+            Priority: 150
+          - ResourceArn: !Ref DomainRuleGroup
+            Priority: 200
+        StatefulDefaultActions:
+          - aws:alert_established
+        StatefulEngineOptions:
+          RuleOrder: STRICT_ORDER
+
+  StandardStatefulRuleGroup:
+    Type: AWS::NetworkFirewall::RuleGroup
+    Properties:
+      RuleGroupName: StandardStatefulRuleGroup
+      Type: STATEFUL
+      Capacity: 100
+      RuleGroup:
+        RulesSource:
+          StatefulRules:
+            - Action: DROP
+              Header:
+                Protocol: UDP
+                Source: 10.1.0.0/16
+                SourcePort: ANY
+                Direction: ANY
+                Destination: ANY
+                DestinationPort: ANY
+              RuleOptions:
+                - Keyword: "sid:1"
+        StatefulRuleOptions:
+          RuleOrder: STRICT_ORDER
+
+  SuricataRuleGroup:
+    Type: AWS::NetworkFirewall::RuleGroup
+    Properties:
+      RuleGroupName: 'SuricataRules'
+      Type: STATEFUL
+      Capacity: 100
+      RuleGroup:
+        RulesSource:
+          RulesString: |
+            drop http $HOME_NET any -> $EXTERNAL_NET any (http.host; content:"neverssl.com"; startswith; endswith; msg:"matching HTTP denylisted FQDNs"; flow:to_server, established; sid:10002; rev:1;)
+            drop tls $HOME_NET any -> $EXTERNAL_NET any (ssl_state:client_hello; tls.sni; content:"twitch.tv"; startswith; nocase; endswith; msg:"Blocking twitch"; flow:to_server, established; sid:10003; rev:1;)
+            drop tls $HOME_NET any -> $EXTERNAL_NET any (ssl_state:client_hello; tls.sni; content:"imdb.com"; startswith; nocase; endswith; msg:"Blocking IMDB"; flow:to_server, established; sid:10004; rev:1;)
+        StatefulRuleOptions:
+          RuleOrder: STRICT_ORDER
+
+  DomainRuleGroup:
+    Type: AWS::NetworkFirewall::RuleGroup
+    Properties:
+      RuleGroupName: 'DomainRules'
+      Type: STATEFUL
+      Capacity: 100
+      RuleGroup:
+        RuleVariables:
+          IPSets:
+            HOME_NET:
+              Definition: ['10.0.0.0/8']
+        RulesSource:
+          RulesSourceList:
+            Targets: ['alexa.com', 'ring.com', 'www.twitch.tv', "neverssl.com"]
+            TargetTypes: ['TLS_SNI', 'HTTP_HOST']
+            GeneratedRulesType: DENYLIST
+        StatefulRuleOptions:
+          RuleOrder: STRICT_ORDER
+
+  FirewallLoggingConfiguration:
+    Type: AWS::NetworkFirewall::LoggingConfiguration
+    Properties:
+      FirewallArn: !Ref NetworkFirewall
+      LoggingConfiguration:
+        LogDestinationConfigs:
+          - LogType: FLOW
+            LogDestinationType: CloudWatchLogs
+            LogDestination:
+              logGroup: !Ref FirewallLogGroup
+          - LogType: ALERT
+            LogDestinationType: CloudWatchLogs
+            LogDestination:
+              logGroup: !Ref FirewallAlertLogGroup
+
+  FirewallLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Ref FirewallFlowLogGroupName
+      RetentionInDays: 7
+
+  FirewallAlertLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Ref FirewallAlertLogGroupName
+      RetentionInDays: 7
+
+
+
+  # ------------------------------
+  # EC2 Instances
+  # ------------------------------
+  Instance1AZ1:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: ami-0440d3b780d96b29d
+      SubnetId: !Ref WorkloadSubnet1
+      SecurityGroupIds:
+        - !Ref SecurityGroup1
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          yum update -y
+          yum install -y python3-pip cronie telnet
+          systemctl enable crond
+          systemctl start crond
+          
+          # Create virtual environment
+          python3 -m venv /home/ec2-user/locust_venv
+          source /home/ec2-user/locust_venv/bin/activate
+          
+          # Install Locust in virtual environment
+          pip3 install locust
+          chmod +x /home/ec2-user/locust_venv/bin/locust
+          
+          cat << 'EOF' > /home/ec2-user/locustfile.py
+          from locust import HttpUser, task, between
+          class WebsiteUser(HttpUser):
+              wait_time = between(1, 2)
+              @task
+              def check_website(self):
+                  self.client.get("/")
+          EOF
+          
+          # Update cron jobs to use the virtual environment's Locust
+          echo "*/10 * * * * sudo /home/ec2-user/locust_venv/bin/locust -f /home/ec2-user/locustfile.py --headless -u 50 -r 10 -H https://checkip.amazonaws.com --run-time 5m >> /home/ec2-user/locust-cron.log 2>&1" \ >> /var/spool/cron/ec2-user
+          echo "*/10 * * * * sudo /home/ec2-user/locust_venv/bin/locust -f /home/ec2-user/locustfile.py --headless -u 50 -r 10 -H https://aws.amazon.com --run-time 5m >> /home/ec2-user/locust-cron.log 2>&1" \ >> /var/spool/cron/ec2-user
+          echo "*/10 * * * * sudo /home/ec2-user/locust_venv/bin/locust -f /home/ec2-user/locustfile.py --headless -u 50 -r 10 -H http://http-textarea.badssl.com/ --run-time 5m >> /home/ec2-user/locust-cron.log 2>&1" \ >> /var/spool/cron/ec2-user
+          echo "*/10 * * * * sudo /home/ec2-user/locust_venv/bin/locust -f /home/ec2-user/locustfile.py --headless -u 50 -r 10 -H http://http.badssl.com/ --run-time 5m >> /home/ec2-user/locust-cron.log 2>&1" \ >> /var/spool/cron/ec2-user
+          
+          DOMAINS=(
+          "checkip.amazonaws.com"
+          "aws.amazon.com"
+          )
+
+          for d in "${DOMAINS[@]}"; do
+          echo "*/10 * * * * dig @8.8.8.8 $d +short >> /var/log/dns-8.8.8.8.log 2>&1" \
+            >> /var/spool/cron/ec2-user
+          echo "*/10 * * * * dig @8.8.4.4 $d +short >> /var/log/dns-8.8.4.4.log 2>&1" \
+            >> /var/spool/cron/ec2-user
+          done
+          
+          PING_HOSTS=(
+            "amazon.com"
+            "nova.amazon.com"
+          )
+          for h in "${PING_HOSTS[@]}"; do
+            echo "*/5 * * * * ping -c 4 \$h >> \
+          /var/log/ping-\$h.log 2>&1" >> /var/spool/cron/ec2-user
+          done
+
+          for d in "${DOMAINS[@]}"; do
+            echo "*/5 * * * * (echo 'quit' | telnet \$d 80) >> /var/log/telnet-\$d.log 2>&1" \
+              >> /var/spool/cron/ec2-user
+          done
+  Instance1AZ2:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: ami-0440d3b780d96b29d
+      SubnetId: !Ref WorkloadSubnet2
+      SecurityGroupIds:
+        - !Ref SecurityGroup1
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          yum update -y
+          yum install -y python3-pip cronie telnet
+          systemctl enable crond
+          systemctl start crond
+          
+          # Create virtual environment
+          python3 -m venv /home/ec2-user/locust_venv
+          source /home/ec2-user/locust_venv/bin/activate
+          
+          # Install Locust in virtual environment
+          pip3 install locust
+          chmod +x /home/ec2-user/locust_venv/bin/locust
+          
+          cat << 'EOF' > /home/ec2-user/locustfile.py
+          from locust import HttpUser, task, between
+          class WebsiteUser(HttpUser):
+              wait_time = between(1, 2)
+              @task
+              def check_website(self):
+                  self.client.get("/")
+          EOF
+          
+          # Update cron jobs to use the virtual environment's Locust
+          echo "*/10 * * * * sudo /home/ec2-user/locust_venv/bin/locust -f /home/ec2-user/locustfile.py --headless -u 50 -r 10 -H https://www.amazon.com/gp/video/storefront --run-time 5m >> /home/ec2-user/locust-cron.log 2>&1" \ >> /var/spool/cron/ec2-user
+          echo "*/10 * * * * sudo /home/ec2-user/locust_venv/bin/locust -f /home/ec2-user/locustfile.py --headless -u 50 -r 10 -H https://audible.com --run-time 5m >> /home/ec2-user/locust-cron.log 2>&1" \ >> /var/spool/cron/ec2-user
+          echo "*/10 * * * * sudo /home/ec2-user/locust_venv/bin/locust -f /home/ec2-user/locustfile.py --headless -u 50 -r 10 -H http://http-textarea.badssl.com/ --run-time 5m >> /home/ec2-user/locust-cron.log 2>&1" \ >> /var/spool/cron/ec2-user
+          echo "*/10 * * * * sudo /home/ec2-user/locust_venv/bin/locust -f /home/ec2-user/locustfile.py --headless -u 50 -r 10 -H http://http.badssl.com/ --run-time 5m >> /home/ec2-user/locust-cron.log 2>&1" \ >> /var/spool/cron/ec2-user
+          
+          DOMAINS=(
+          "checkip.amazonaws.com"
+          "aws.amazon.com"
+          )
+
+          for d in "${DOMAINS[@]}"; do
+          echo "*/10 * * * * dig @8.8.8.8 $d +short >> /var/log/dns-8.8.8.8.log 2>&1" \
+            >> /var/spool/cron/ec2-user
+          echo "*/10 * * * * dig @8.8.4.4 $d +short >> /var/log/dns-8.8.4.4.log 2>&1" \
+            >> /var/spool/cron/ec2-user
+          done
+
+          PING_HOSTS=(
+            "amazon.com"
+            "nova.amazon.com"
+          )
+          for h in "${PING_HOSTS[@]}"; do
+            echo "*/5 * * * * ping -c 4 \$h >> \
+          /var/log/ping-\$h.log 2>&1" >> /var/spool/cron/ec2-user
+          done
+
+          for d in "${DOMAINS[@]}"; do
+            echo "*/5 * * * * (echo 'quit' | telnet \$d 80) >> /var/log/telnet-\$d.log 2>&1" \
+              >> /var/spool/cron/ec2-user
+          done
+          
+  Instance2AZ1:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: ami-0440d3b780d96b29d
+      SubnetId: !Ref WorkloadSubnet1
+      SecurityGroupIds:
+        - !Ref SecurityGroup1
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          yum update -y
+          yum install -y python3-pip cronie telnet
+          systemctl enable crond
+          systemctl start crond
+          
+          # Create virtual environment
+          python3 -m venv /home/ec2-user/locust_venv
+          source /home/ec2-user/locust_venv/bin/activate
+          
+          # Install Locust in virtual environment
+          pip3 install locust
+          chmod +x /home/ec2-user/locust_venv/bin/locust
+          
+          cat << 'EOF' > /home/ec2-user/locustfile.py
+          from locust import HttpUser, task, between
+          class WebsiteUser(HttpUser):
+              wait_time = between(1, 2)
+              @task
+              def check_website(self):
+                  self.client.get("/")
+          EOF
+          
+          # Update cron jobs to use the virtual environment's Locust
+          echo "*/10 * * * * sudo /home/ec2-user/locust_venv/bin/locust -f /home/ec2-user/locustfile.py --headless -u 50 -r 10 -H https://ring.com --run-time 5m >> /home/ec2-user/locust-cron.log 2>&1" \ >> /var/spool/cron/ec2-user
+          echo "*/10 * * * * sudo /home/ec2-user/locust_venv/bin/locust -f /home/ec2-user/locustfile.py --headless -u 50 -r 10 -H https://twitch.tv --run-time 5m >> /home/ec2-user/locust-cron.log 2>&1" \ >> /var/spool/cron/ec2-user
+          echo "*/10 * * * * sudo /home/ec2-user/locust_venv/bin/locust -f /home/ec2-user/locustfile.py --headless -u 50 -r 10 -H http://neverssl.com --run-time 5m >> /home/ec2-user/locust-cron.log 2>&1" \ >> /var/spool/cron/ec2-user
+          echo "*/10 * * * * sudo /home/ec2-user/locust_venv/bin/locust -f /home/ec2-user/locustfile.py --headless -u 50 -r 10 -H http://httpforever.com --run-time 5m >> /home/ec2-user/locust-cron.log 2>&1" \ >> /var/spool/cron/ec2-user
+          
+          DOMAINS=(
+          "checkip.amazonaws.com"
+          "aws.amazon.com"
+          )
+
+          for d in "${DOMAINS[@]}"; do
+          echo "*/10 * * * * dig @8.8.8.8 $d +short >> /var/log/dns-8.8.8.8.log 2>&1" \
+            >> /var/spool/cron/ec2-user
+          echo "*/10 * * * * dig @8.8.4.4 $d +short >> /var/log/dns-8.8.4.4.log 2>&1" \
+            >> /var/spool/cron/ec2-user
+          done
+
+          PING_HOSTS=(
+            "amazon.com"
+            "nova.amazon.com"
+          )
+          for h in "${PING_HOSTS[@]}"; do
+            echo "*/5 * * * * ping -c 40 \$h >> \
+          /var/log/ping-\$h.log 2>&1" >> /var/spool/cron/ec2-user
+          done
+
+          for d in "${DOMAINS[@]}"; do
+            echo "*/5 * * * * (echo 'quit' | telnet \$d 80) >> /var/log/telnet-\$d.log 2>&1" \
+              >> /var/spool/cron/ec2-user
+          done
+
+  Instance2AZ2:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: ami-0440d3b780d96b29d
+      SubnetId: !Ref WorkloadSubnet2
+      SecurityGroupIds:
+        - !Ref SecurityGroup1
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          yum update -y
+          yum install -y python3-pip cronie telnet
+          systemctl enable crond
+          systemctl start crond
+          
+          # Create virtual environment
+          python3 -m venv /home/ec2-user/locust_venv
+          source /home/ec2-user/locust_venv/bin/activate
+          
+          # Install Locust in virtual environment
+          pip3 install locust
+          chmod +x /home/ec2-user/locust_venv/bin/locust
+          
+          cat << 'EOF' > /home/ec2-user/locustfile.py
+          from locust import HttpUser, task, between
+          class WebsiteUser(HttpUser):
+              wait_time = between(1, 2)
+              @task
+              def check_website(self):
+                  self.client.get("/")
+          EOF
+          
+          # Update cron jobs to use the virtual environment's Locust
+          echo "*/10 * * * * sudo /home/ec2-user/locust_venv/bin/locust -f /home/ec2-user/locustfile.py --headless -u 50 -r 10 -H https://alexa.com --run-time 5m >> /home/ec2-user/locust-cron.log 2>&1" \ >> /var/spool/cron/ec2-user
+          echo "*/10 * * * * sudo /home/ec2-user/locust_venv/bin/locust -f /home/ec2-user/locustfile.py --headless -u 50 -r 10 -H https://aws.amazon.com --run-time 5m >> /home/ec2-user/locust-cron.log 2>&1" \ >> /var/spool/cron/ec2-user
+          echo "*/10 * * * * sudo /home/ec2-user/locust_venv/bin/locust -f /home/ec2-user/locustfile.py --headless -u 50 -r 10 -H http://neverssl.com --run-time 5m >> /home/ec2-user/locust-cron.log 2>&1" \ >> /var/spool/cron/ec2-user
+          echo "*/10 * * * * sudo /home/ec2-user/locust_venv/bin/locust -f /home/ec2-user/locustfile.py --headless -u 50 -r 10 -H http://httpforever.com --run-time 5m >> /home/ec2-user/locust-cron.log 2>&1" \ >> /var/spool/cron/ec2-user
+          
+          DOMAINS=(
+          "checkip.amazonaws.com"
+          "aws.amazon.com"
+          )
+
+          for d in "${DOMAINS[@]}"; do
+          echo "*/10 * * * * dig @8.8.8.8 $d +short >> /var/log/dns-8.8.8.8.log 2>&1" \
+            >> /var/spool/cron/ec2-user
+          echo "*/10 * * * * dig @8.8.4.4 $d +short >> /var/log/dns-8.8.4.4.log 2>&1" \
+            >> /var/spool/cron/ec2-user
+          done
+
+          PING_HOSTS=(
+            "amazon.com"
+            "nova.amazon.com"
+          )
+          for h in "${PING_HOSTS[@]}"; do
+            echo "*/5 * * * * ping -c 40 \$h >> \
+          /var/log/ping-\$h.log 2>&1" >> /var/spool/cron/ec2-user
+          done
+
+          for d in "${DOMAINS[@]}"; do
+            echo "*/5 * * * * (echo 'quit' | telnet \$d 80) >> /var/log/telnet-\$d.log 2>&1" \
+              >> /var/spool/cron/ec2-user
+          done
+
+  Instance3AZ1:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: ami-0440d3b780d96b29d
+      SubnetId: !Ref WorkloadSubnet1
+      SecurityGroupIds:
+        - !Ref SecurityGroup1
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          yum update -y
+          yum install -y python3-pip cronie telnet
+          systemctl enable crond
+          systemctl start crond
+          
+          # Create virtual environment
+          python3 -m venv /home/ec2-user/locust_venv
+          source /home/ec2-user/locust_venv/bin/activate
+          
+          # Install Locust in virtual environment
+          pip3 install locust
+          chmod +x /home/ec2-user/locust_venv/bin/locust
+          
+          cat << 'EOF' > /home/ec2-user/locustfile.py
+          from locust import HttpUser, task, between
+          class WebsiteUser(HttpUser):
+              wait_time = between(1, 2)
+              @task
+              def check_website(self):
+                  self.client.get("/")
+          EOF
+          
+          # Update cron jobs to use the virtual environment's Locust
+          echo "*/10 * * * * sudo /home/ec2-user/locust_venv/bin/locust -f /home/ec2-user/locustfile.py --headless -u 50 -r 10 -H https://imdb.com --run-time 5m >> /home/ec2-user/locust-cron.log 2>&1" \ >> /var/spool/cron/ec2-user
+          echo "*/10 * * * * sudo /home/ec2-user/locust_venv/bin/locust -f /home/ec2-user/locustfile.py --headless -u 50 -r 10 -H https://primevideo.com --run-time 5m >> /home/ec2-user/locust-cron.log 2>&1" \ >> /var/spool/cron/ec2-user
+          echo "*/10 * * * * sudo /home/ec2-user/locust_venv/bin/locust -f /home/ec2-user/locustfile.py --headless -u 50 -r 10 -H http://http-textarea.badssl.com/ --run-time 5m >> /home/ec2-user/locust-cron.log 2>&1" \ >> /var/spool/cron/ec2-user
+          echo "*/10 * * * * sudo /home/ec2-user/locust_venv/bin/locust -f /home/ec2-user/locustfile.py --headless -u 50 -r 10 -H http://http.badssl.com/ --run-time 5m >> /home/ec2-user/locust-cron.log 2>&1" \ >> /var/spool/cron/ec2-user
+          
+          DOMAINS=(
+          "checkip.amazonaws.com"
+          "aws.amazon.com"
+          )
+
+          for d in "${DOMAINS[@]}"; do
+          echo "*/10 * * * * dig @8.8.8.8 $d +short >> /var/log/dns-8.8.8.8.log 2>&1" \
+            >> /var/spool/cron/ec2-user
+          echo "*/10 * * * * dig @8.8.4.4 $d +short >> /var/log/dns-8.8.4.4.log 2>&1" \
+            >> /var/spool/cron/ec2-user
+          done
+
+          PING_HOSTS=(
+            "amazon.com"
+            "nova.amazon.com"
+          )
+          for h in "${PING_HOSTS[@]}"; do
+            echo "*/5 * * * * ping -c 20 \$h >> \
+          /var/log/ping-\$h.log 2>&1" >> /var/spool/cron/ec2-user
+          done
+
+          for d in "${DOMAINS[@]}"; do
+            echo "*/5 * * * * (echo 'quit' | telnet \$d 80) >> /var/log/telnet-\$d.log 2>&1" \
+              >> /var/spool/cron/ec2-user
+          done
+
+  Instance3AZ2:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: ami-0440d3b780d96b29d
+      SubnetId: !Ref WorkloadSubnet2
+      SecurityGroupIds:
+        - !Ref SecurityGroup1
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          yum update -y
+          yum install -y python3-pip cronie telnet
+          systemctl enable crond
+          systemctl start crond
+          
+          # Create virtual environment
+          python3 -m venv /home/ec2-user/locust_venv
+          source /home/ec2-user/locust_venv/bin/activate
+          
+          # Install Locust in virtual environment
+          pip3 install locust
+          chmod +x /home/ec2-user/locust_venv/bin/locust
+
+          cat << 'EOF' > /home/ec2-user/locustfile.py
+          from locust import HttpUser, task, between
+          class WebsiteUser(HttpUser):
+              wait_time = between(1, 2)
+              @task
+              def check_website(self):
+                  self.client.get("/")
+          EOF
+          
+          # Update cron jobs to use the virtual environment's Locust
+          echo "*/10 * * * * sudo /home/ec2-user/locust_venv/bin/locust -f /home/ec2-user/locustfile.py --headless -u 50 -r 10 -H https://amazongames.com --run-time 5m >> /home/ec2-user/locust-cron.log 2>&1" \ >> /var/spool/cron/ec2-user
+          echo "*/10 * * * * sudo /home/ec2-user/locust_venv/bin/locust -f /home/ec2-user/locustfile.py --headless -u 50 -r 10 -H https://zappos.com --run-time 5m >> /home/ec2-user/locust-cron.log 2>&1" \ >> /var/spool/cron/ec2-user
+          echo "*/10 * * * * sudo /home/ec2-user/locust_venv/bin/locust -f /home/ec2-user/locustfile.py --headless -u 50 -r 10 -H http://neverssl.com --run-time 5m >> /home/ec2-user/locust-cron.log 2>&1" \ >> /var/spool/cron/ec2-user
+          echo "*/10 * * * * sudo /home/ec2-user/locust_venv/bin/locust -f /home/ec2-user/locustfile.py --headless -u 50 -r 10 -H http://httpforever.com --run-time 5m >> /home/ec2-user/locust-cron.log 2>&1" \ >> /var/spool/cron/ec2-user
+          
+          DOMAINS=(
+          "checkip.amazonaws.com"
+          "aws.amazon.com"
+          )
+
+          for d in "${DOMAINS[@]}"; do
+          echo "*/10 * * * * dig @8.8.8.8 $d +short >> /var/log/dns-8.8.8.8.log 2>&1" \
+            >> /var/spool/cron/ec2-user
+          echo "*/10 * * * * dig @8.8.4.4 $d +short >> /var/log/dns-8.8.4.4.log 2>&1" \
+            >> /var/spool/cron/ec2-user
+          done
+
+          PING_HOSTS=(
+            "amazon.com"
+            "nova.amazon.com"
+          )
+          for h in "${PING_HOSTS[@]}"; do
+            echo "*/5 * * * * ping -c 20 \$h >> \
+          /var/log/ping-\$h.log 2>&1" >> /var/spool/cron/ec2-user
+          done
+
+          for d in "${DOMAINS[@]}"; do
+            echo "*/5 * * * * (echo 'quit' | telnet \$d 80) >> /var/log/telnet-\$d.log 2>&1" \
+              >> /var/spool/cron/ec2-user
+          done
+          
+  # ------------------------------
+  # Security Groups
+  # ------------------------------
+  SecurityGroup1:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTPS/DNS outbound and SSH between workloads
+      VpcId: !Ref InspectionVPC
+
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 10.0.0.0/16
+
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  # ------------------------------
+  # IAM Role & Instance Profile
+  # ------------------------------
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: CustomEC2Policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2InstanceRole
+
+  # ------------------------------
+  # Bedrock Cache Table & Lambda
+  # ------------------------------
+  BedrockCacheTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: log_group_arn
+          AttributeType: S
+      KeySchema:
+        - AttributeName: log_group_arn
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+  
+  ScopedCustomPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      Roles:
+        - !Ref LambdaBedrockCwExecutionRole
+      PolicyName: DynamoBedrockScopedPolicy
+      PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - bedrock:InvokeModel
+                Resource:
+                  - !Sub arn:${AWS::Partition}:bedrock:*::foundation-model/amazon.nova-micro-v1:0
+                  - !GetAtt BedrockCacheTable.Arn
+
+  LambdaBedrockCwExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/CloudWatchLogsReadOnlyAccess
+
+  LambdaFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W84
+            reason: "KMS Encryption is not necessary for demonstration purposes"
+    Properties:
+      RetentionInDays: 7
+      LogGroupName: cw-bedrock-lambda-log
+
+  BedrockLogCWFunction:
+    DependsOn: ScopedCustomPolicy
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "This function does not access any VPC resources"
+    Properties:
+      LoggingConfig:
+        LogGroup: !Ref LambdaFunctionLogGroup
+      FunctionName: BedrockLogAnalysisFunction
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaBedrockCwExecutionRole.Arn
+      Environment:
+        Variables:
+          cache_name: !Ref BedrockCacheTable
+      Runtime: python3.12
+      ReservedConcurrentExecutions: 5
+      Timeout: 45
+      Code:
+        ZipFile: |
+          import os
+          import time
+          import json
+          from dataclasses import dataclass
+          from typing import Optional
+          import boto3
+          from botocore.exceptions import ClientError
+
+          MAX_RETRIES = 3
+          BACKOFF_FACTOR = 2
+          MAX_CHAR_INPUT = 128000  # Truncate to fit model token limits safely
+
+          @dataclass
+          class CacheItem:
+              log_group_arn: str
+              summary: str
+              timestamp: int
+
+          def get_summary_cache(log_group_arn: str) -> Optional[CacheItem]:
+              dynamodb = boto3.resource("dynamodb")
+              table = dynamodb.Table(os.environ["cache_name"])
+              try:
+                  resp = table.get_item(Key={"log_group_arn": log_group_arn})
+              except ClientError:
+                  return None
+              item = resp.get("Item")
+              return CacheItem(**item) if item else None
+
+          def put_summary(log_group_arn: str, summary: str) -> None:
+              dynamodb = boto3.resource("dynamodb")
+              table = dynamodb.Table(os.environ["cache_name"])
+              table.put_item(Item={
+                  "log_group_arn": log_group_arn,
+                  "summary": summary,
+                  "timestamp": int(time.time()),
+              })
+
+          def bedrock_analyze(log_text: str, user_prompt: str) -> str:
+              base_prompt = user_prompt.strip() or "Please create some insights on the following log string"
+              client = boto3.client("bedrock-runtime")
+
+              # Truncate input to avoid model overload
+              truncated_log = log_text[:MAX_CHAR_INPUT]
+              full_prompt = f"{base_prompt}. {truncated_log}"
+
+              body = {
+                  "schemaVersion": "messages-v1",
+                  "system": [
+                      { "text": base_prompt }
+                  ],
+                  "messages": [
+                      {
+                          "role": "user",
+                          "content": [
+                              { "text": truncated_log }
+                          ]
+                      }
+                  ],
+                  "inferenceConfig": {
+                      "maxTokens": 1000,
+                      "temperature": 0,
+                      "topP": 1,
+                      "stopSequences": []
+                  }
+              }
+
+              blob = bytes(json.dumps(body), "utf-8")
+              retry_count = 0
+
+              while retry_count < MAX_RETRIES:
+                  try:
+                      response = client.invoke_model(
+                          modelId="amazon.nova-micro-v1:0",
+                          body=blob,
+                          contentType="application/json",
+                      )
+                      resp_blob = response["body"].read().decode("utf-8")
+                      data = json.loads(resp_blob)
+
+                       # New primary path (current Bedrock “output” shape)
+                      if "output" in data and "message" in data["output"]:
+                          text = data["output"]["message"]["content"][0]["text"]
+
+                      # Messages-API path
+                      elif "messages" in data and data["messages"]:
+                          text = data["messages"][0]["content"][0]["text"]
+
+                      # Legacy text-generation path
+                      elif "content" in data and data["content"]:
+                          item = data["content"][0]
+                          text = item.get("text") or item.get("generatedText", "")
+
+                      else:
+                          raise KeyError(f"No usable text; keys: {list(data.keys())}")
+
+                      return text.replace("\n", "<br />")
+
+                  except client.exceptions.ThrottlingException:
+                      time.sleep(BACKOFF_FACTOR ** retry_count)
+                      retry_count += 1
+                  except Exception as e:
+                      return f"<b>Error:</b> {str(e)}"
+
+              return "<b>Error:</b> Max retries reached"
+
+          def recent_log_stream(log_group_arn: str) -> str:
+              logs = boto3.client("logs")
+              resp = logs.describe_log_streams(
+                  logGroupIdentifier=log_group_arn,
+                  orderBy='LastEventTime',
+                  descending=True
+              )
+              streams = resp.get("logStreams", [])
+              if not streams:
+                  raise Exception("No log streams found")
+              return streams[0]["logStreamName"]
+
+          def fetch_analysis(log_group_arn: str, user_prompt: str) -> str:
+              logs = boto3.client("logs")
+              stream = recent_log_stream(log_group_arn)
+              resp = logs.get_log_events(
+                  logGroupIdentifier=log_group_arn,
+                  logStreamName=stream,
+                  limit=50
+              )
+              events = resp.get("events", [])
+              if not events:
+                  raise Exception("No events to analyze")
+              joined = "\n".join(f"[{e['timestamp']}] {e['message']}" for e in events)
+              analysis = bedrock_analyze(joined, user_prompt)
+              put_summary(log_group_arn, analysis)
+              return analysis
+
+          def lambda_handler(event, context):
+              if event.get("describe"):
+                  return """## Bedrock Log Analysis Widget
+                  **Parameters:**
+                  - log_group_arn: ARN of the log group to summarize  
+                  - custom_prompt: (optional) Lead-in text for analysis
+                  """
+
+              params = event.get("widgetContext", {}).get("params", {})
+              lg_arn = params.get("log_group_arn")
+              prompt = params.get("custom_prompt", "")
+
+              if isinstance(lg_arn, dict):
+                  lg_arn = lg_arn.get("default", "")
+              if isinstance(prompt, dict):
+                  prompt = prompt.get("default", "")
+
+              if not lg_arn:
+                  return "Error: Missing 'log_group_arn'."
+
+              summary = fetch_analysis(lg_arn, prompt)
+
+              enc = lg_arn.replace("/", "$252F")
+              overview = f"https://console.aws.amazon.com/cloudwatch/home#logsV2:log-groups/log-group/{enc}"
+              insights = f"https://console.aws.amazon.com/cloudwatch/home#logsV2:logs-insights$3Fsource~(~'{enc})"
+              tail = f"https://console.aws.amazon.com/cloudwatch/home#logsV2:live-tail$3FlogGroupArns$3D~(~'{enc})"
+
+              html = f"""
+              <h2>Last 50 events</h2>
+              <p>{summary}</p>
+              <a class="btn btn-primary">Refresh</a>
+              <cwdb-action action="call" endpoint="{context.invoked_function_arn}">
+                {{ "log_group_arn": "{lg_arn}", "custom_prompt": "{prompt}" }}
+              </cwdb-action>
+              <a class="btn btn-primary" href="{overview}">Overview</a>
+              <a class="btn btn-primary" href="{insights}">Insights</a>
+              <a class="btn btn-primary" href="{tail}">Live Tail</a>
+              """
+              return html
+
+   ##### Custom Resource #####
+
+    # Lambda Function Converts Subnet List to String for Substition in PrivateLink Metric Search Expressions
+  GenerateSubnetQueryStringFunction:
+      Type: AWS::Lambda::Function
+      Properties:
+        Handler: index.lambda_handler
+        Role: !GetAtt  GenerateSubnetQueryStringFunctionRole.Arn
+        Runtime: python3.9
+        Code:
+          ZipFile: |
+            import cfnresponse
+            import boto3
+            import botocore
+            import logging
+            import json
+
+            logger = logging.getLogger()
+            logger.setLevel(logging.INFO)
+
+            def lambda_handler(event, context):
+                logger.info(f"Got event\n{json.dumps(event,indent=4, sort_keys=False)}")
+                responseData = {}
+                subnets = event['ResourceProperties']['FirewallSubnetList']
+
+                try:
+                    logger.info(f'Incoming RequestType: {event["RequestType"]}')
+
+                    # send success signal on delete
+                    if event['RequestType'] in ["Delete"]:
+                        cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+
+                    if event['RequestType'] in ["Create","Update"]:
+                      responseData = {}
+                      subnet_assignment = []
+                      for subnet in subnets:
+                          subnet_assignment.append(f'\\"Subnet Id\\"=\\"{subnet}\\"')
+                      subnet_query_string=' OR '.join(subnet_assignment)
+                      logger.info(subnet_query_string)
+                      responseData['SubnetQueryString']=subnet_query_string
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+                except Exception as err:
+                    error_msg = str(err)
+                    logger.warning(error_msg)
+                    responseData = {"Data": error_msg}
+                    cfnresponse.send(event, context, cfnresponse.FAILED, responseData)
+                    raise err
+                return
+
+    #Custom Resource For Subnet List to String
+  GenerateSubnetQueryStringCustomResource:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt GenerateSubnetQueryStringFunction.Arn
+      FirewallSubnetList:
+        - !Ref FirewallSubnet1
+        - !Ref FirewallSubnet2
+
+  #Role Allowing Lambda to Publish Log Events to CloudWatch
+  GenerateSubnetQueryStringFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: CustomLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+
+  ##### Contributor Insights Rules #####
+
+  # Contributor Insights Rule - Top Long-Lived TCP Flows - Age > 350 Seconds
+  TopLongLivedTCPFlowsRule:
+    Type: AWS::CloudWatch::InsightRule
+    Properties:
+      RuleBody: !Sub |
+        {
+            "AggregateOn": "Count",
+            "Contribution": {
+            "Filters": [{
+              "Match": "$.event.netflow.age",
+              "GreaterThan": 350
+            },
+            {
+              "Match": "$.event.proto",
+              "In": [
+                  "TCP"
+              ]
+            }
+            ],
+            "Keys": [
+              "$.event.src_ip",
+              "$.event.src_port",
+              "$.event.dest_ip",
+              "$.event.dest_port"
+            ]
+            },
+            "LogFormat": "JSON",
+            "Schema": {
+            "Name": "CloudWatchLogRule",
+            "Version": 1
+            },
+            "LogGroupNames":[
+              "${FirewallFlowLogGroupName}"
+            ]
+        }
+      RuleName: !Sub TopLongLivedTCPFlowsRule-${FirewallName}
+      RuleState: !Ref ContributorInsightsRuleState
+
+  # Contributor Insights Rule - TCP SYN Without SYN-ACK
+  TopTCPSYNWithoutSYNACKRule:
+    Type: AWS::CloudWatch::InsightRule
+    Properties:
+      RuleBody: !Sub |
+        {
+            "AggregateOn": "Count",
+            "Contribution": {
+            "Filters": [{
+              "Match": "$.event.tcp.tcp_flags",
+              "In": [
+              "02"
+            ]
+            }],
+            "Keys": [
+              "$.event.src_ip",
+              "$.event.src_port",
+              "$.event.dest_ip",
+              "$.event.dest_port"
+            ]
+            },
+            "LogFormat": "JSON",
+            "Schema": {
+            "Name": "CloudWatchLogRule",
+            "Version": 1
+            },
+            "LogGroupNames":[
+              "${FirewallFlowLogGroupName}"
+            ]
+        }
+      RuleName: !Sub TopTCPSYNWithoutSYNACKRule-${FirewallName}
+      RuleState: !Ref ContributorInsightsRuleState
+
+  # Contributor Insights Rule - Top Source IP by Packets
+  TopSourceIPByPacketsRule:
+    Type: AWS::CloudWatch::InsightRule
+    Properties:
+      RuleBody: !Sub |
+        {
+          "AggregateOn": "Sum",
+          "Contribution": {
+            "Filters": [],
+            "Keys": [
+              "$.event.src_ip"
+            ],
+            "ValueOf": "$.event.netflow.pkts"
+          },
+          "LogFormat": "JSON",
+          "Schema": {
+            "Name": "CloudWatchLogRule",
+            "Version": 1
+          },
+          "LogGroupNames": [
+            "${FirewallFlowLogGroupName}"
+          ]
+        }
+      RuleName: !Sub TopSourceIPByPacketsRule-${FirewallName}
+      RuleState: !Ref ContributorInsightsRuleState
+  
+  # Contributor Insights Rule - Top Source IP by Bytes
+  TopSourceIPByBytesRule:
+    Type: AWS::CloudWatch::InsightRule
+    Properties:
+      RuleBody: !Sub |
+        {
+          "AggregateOn": "Sum",
+          "Contribution": {
+            "Filters": [],
+            "Keys": [
+              "$.event.src_ip"
+            ],
+            "ValueOf": "$.event.netflow.bytes"
+          },
+          "LogFormat": "JSON",
+          "Schema": {
+            "Name": "CloudWatchLogRule",
+            "Version": 1
+          },
+          "LogGroupNames": [
+            "${FirewallFlowLogGroupName}"
+          ]
+        }
+      RuleName: !Sub TopSourceIPByBytesRule-${FirewallName}
+      RuleState: !Ref ContributorInsightsRuleState
+
+  # Contributor Insights Rule - Top Destination IP by Packets
+  TopDestinationIPByPacketsRule:
+    Type: AWS::CloudWatch::InsightRule
+    Properties:
+      RuleBody: !Sub |
+        {
+          "AggregateOn": "Sum",
+          "Contribution": {
+            "Filters": [],
+            "Keys": [
+              "$.event.dest_ip"
+            ],
+            "ValueOf": "$.event.netflow.pkts"
+          },
+          "LogFormat": "JSON",
+          "Schema": {
+            "Name": "CloudWatchLogRule",
+            "Version": 1
+          },
+          "LogGroupNames": [
+            "${FirewallFlowLogGroupName}"
+          ]
+        }
+      RuleName: !Sub TopDestinationIPByPacketsRule-${FirewallName}
+      RuleState: !Ref ContributorInsightsRuleState
+
+  # Contributor Insights Rule - Top Destination IP by Bytes
+  TopDestinationIPByBytesRule:
+    Type: AWS::CloudWatch::InsightRule
+    Properties:
+      RuleBody: !Sub |
+        {
+          "AggregateOn": "Sum",
+          "Contribution": {
+            "Filters": [],
+            "Keys": [
+              "$.event.dest_ip"
+            ],
+            "ValueOf": "$.event.netflow.bytes"
+          },
+          "LogFormat": "JSON",
+          "Schema": {
+            "Name": "CloudWatchLogRule",
+            "Version": 1
+          },
+          "LogGroupNames": [
+            "${FirewallFlowLogGroupName}"
+          ]
+        }
+      RuleName: !Sub TopDestinationIPByBytesRule-${FirewallName}
+      RuleState: !Ref ContributorInsightsRuleState
+
+  # Contributor Insights Rule - Top Source and Destination IP by Packets
+  TopSourceAndDestinationIPByPacketsRule:
+    Type: AWS::CloudWatch::InsightRule
+    Properties:
+      RuleBody: !Sub |
+        {
+          "AggregateOn": "Sum",
+          "Contribution": {
+            "Filters": [],
+            "Keys": [
+              "$.event.src_ip",
+              "$.event.dest_ip"
+            ],
+            "ValueOf": "$.event.netflow.pkts"
+          },
+          "LogFormat": "JSON",
+          "Schema": {
+            "Name": "CloudWatchLogRule",
+            "Version": 1
+          },
+          "LogGroupNames": [
+            "${FirewallFlowLogGroupName}"
+          ]
+        }
+      RuleName: !Sub TopSourceAndDestinationIPByPacketsRule-${FirewallName}
+      RuleState: !Ref ContributorInsightsRuleState
+
+  # Contributor Insights Rule - Top Source and Destination IP by Bytes
+  TopSourceAndDestinationIPByBytesRule:
+    Type: AWS::CloudWatch::InsightRule
+    Properties:
+      RuleBody: !Sub |
+        {
+            "AggregateOn": "Sum",
+            "Contribution": {
+              "Filters": [],
+              "Keys": [
+                "$.event.src_ip",
+                "$.event.dest_ip"
+              ],
+              "ValueOf": "$.event.netflow.bytes"
+            },
+            "LogFormat": "JSON",
+            "Schema": {
+            "Name": "CloudWatchLogRule",
+            "Version": 1
+            },
+            "LogGroupNames":[
+              "${FirewallFlowLogGroupName}"
+            ]
+        }
+      RuleName: !Sub TopSourceAndDestinationIPByBytesRule-${FirewallName}
+      RuleState: !Ref ContributorInsightsRuleState
+  
+  # Contributor Insights Rule - Top Source Ports
+  TopSourcePortsRule:
+    Type: AWS::CloudWatch::InsightRule
+    Properties:
+      RuleBody: !Sub |
+        {
+          "AggregateOn": "Count",
+          "Contribution": {
+            "Filters": [],
+            "Keys": [
+              "$.event.src_port"
+            ]
+          },
+          "LogFormat": "JSON",
+          "Schema": {
+            "Name": "CloudWatchLogRule",
+            "Version": 1
+          },
+          "LogGroupNames": [
+            "${FirewallFlowLogGroupName}"
+          ]
+        }
+      RuleName: !Sub TopSourcePortsRule-${FirewallName}
+      RuleState: !Ref ContributorInsightsRuleState 
+
+  # Contributor Insights Rule - Top Destination Ports
+  TopDestinationPortsRule:
+    Type: AWS::CloudWatch::InsightRule
+    Properties:
+      RuleBody: !Sub |
+        {
+          "AggregateOn": "Count",
+          "Contribution": {
+            "Filters": [],
+            "Keys": [
+              "$.event.dest_port"
+            ]
+          },
+          "LogFormat": "JSON",
+          "Schema": {
+            "Name": "CloudWatchLogRule",
+            "Version": 1
+          },
+          "LogGroupNames": [
+            "${FirewallFlowLogGroupName}"
+          ]
+        }
+      RuleName: !Sub TopDestinationPortsRule-${FirewallName}
+      RuleState: !Ref ContributorInsightsRuleState
+
+  # Contributor Insights Rule - Top TCP Flows
+  TopTCPFlowsRule:
+    Type: AWS::CloudWatch::InsightRule
+    Properties:
+      RuleBody: !Sub |
+        {
+            "AggregateOn": "Count",
+            "Contribution": {
+            "Filters": [{
+              "Match": "$.event.proto",
+              "In": [
+              "TCP"
+            ]
+            }],
+            "Keys": [
+              "$.event.src_ip",
+              "$.event.dest_ip",
+              "$.event.dest_port"
+            ]
+            },
+            "LogFormat": "JSON",
+            "Schema": {
+            "Name": "CloudWatchLogRule",
+            "Version": 1
+            },
+            "LogGroupNames":[
+              "${FirewallFlowLogGroupName}"
+            ]
+        }
+      RuleName: !Sub TopTCPFlowsRule-${FirewallName}
+      RuleState: !Ref ContributorInsightsRuleState
+                    
+  # Contributor Insights Rule - Top TCP Flows by Packets
+  TopTCPFlowsByPacketsRule:
+    Type: AWS::CloudWatch::InsightRule
+    Properties:
+      RuleBody: !Sub |
+        {
+          "AggregateOn": "Sum",
+          "Contribution": {
+            "Filters": [
+              {
+                "Match": "$.event.proto",
+                "In": [
+                  "TCP"
+                ]
+              }
+            ],
+            "Keys": [
+              "$.event.src_ip",
+              "$.event.dest_ip",
+              "$.event.dest_port"
+            ],
+            "ValueOf": "$.event.netflow.pkts"
+          },
+          "LogFormat": "JSON",
+          "Schema": {
+            "Name": "CloudWatchLogRule",
+            "Version": 1
+          },
+          "LogGroupNames": [
+            "${FirewallFlowLogGroupName}"
+          ]
+        }
+      RuleName: !Sub TopTCPFlowsByPacketsRule-${FirewallName}
+      RuleState: !Ref ContributorInsightsRuleState
+  
+  # Contributor Insights Rule - Top TCP Flows by Bytes
+  TopTCPFlowsByBytesRule:
+    Type: AWS::CloudWatch::InsightRule
+    Properties:
+      RuleBody: !Sub |
+        {
+          "AggregateOn": "Sum",
+          "Contribution": {
+            "Filters": [
+              {
+                "Match": "$.event.proto",
+                "In": [
+                  "TCP"
+                ]
+              }
+            ],
+            "Keys": [
+              "$.event.src_ip",
+              "$.event.dest_ip",
+              "$.event.dest_port"
+            ],
+            "ValueOf": "$.event.netflow.bytes"
+          },
+          "LogFormat": "JSON",
+          "Schema": {
+            "Name": "CloudWatchLogRule",
+            "Version": 1
+          },
+          "LogGroupNames": [
+            "${FirewallFlowLogGroupName}"
+          ]
+        }
+      RuleName: !Sub TopTCPFlowsByBytesRule-${FirewallName}
+      RuleState: !Ref ContributorInsightsRuleState
+
+  # Contributor Insights Rule - Top UDP Flows
+  TopUDPFlowsRule:
+    Type: AWS::CloudWatch::InsightRule
+    Properties:
+      RuleBody: !Sub |
+        {
+            "AggregateOn": "Count",
+            "Contribution": {
+            "Filters": [{
+              "Match": "$.event.proto",
+              "In": [
+                "UDP"
+            ]
+            }],
+            "Keys": [
+              "$.event.src_ip",
+              "$.event.dest_ip",
+              "$.event.dest_port"
+            ]
+            },
+            "LogFormat": "JSON",
+            "Schema": {
+            "Name": "CloudWatchLogRule",
+            "Version": 1
+            },
+            "LogGroupNames":[
+              "${FirewallFlowLogGroupName}"
+            ]
+        }
+      RuleName: !Sub TopUDPFlowsRule-${FirewallName}
+      RuleState: !Ref ContributorInsightsRuleState
+
+  # Contributor Insights Rule - Top UDP Flows by Packets
+  TopUDPFlowsByPacketsRule:
+    Type: AWS::CloudWatch::InsightRule
+    Properties:
+      RuleBody: !Sub |
+        {
+          "AggregateOn": "Sum",
+          "Contribution": {
+            "Filters": [
+              {
+                "Match": "$.event.proto",
+                "In": [
+                  "UDP"
+                ]
+              }
+            ],
+            "Keys": [
+              "$.event.src_ip",
+              "$.event.dest_ip",
+              "$.event.dest_port"
+            ],
+            "ValueOf": "$.event.netflow.pkts"
+          },
+          "LogFormat": "JSON",
+          "Schema": {
+            "Name": "CloudWatchLogRule",
+            "Version": 1
+          },
+          "LogGroupNames": [
+            "${FirewallFlowLogGroupName}"
+          ]
+        }
+      RuleName: !Sub TopUDPFlowsByPacketsRule-${FirewallName}
+      RuleState: !Ref ContributorInsightsRuleState
+
+  # Contributor Insights Rule - Top UDP Flows by Bytes
+  TopUDPFlowsByBytesRule:
+    Type: AWS::CloudWatch::InsightRule
+    Properties:
+      RuleBody: !Sub |
+        {
+          "AggregateOn": "Sum",
+          "Contribution": {
+            "Filters": [
+              {
+                "Match": "$.event.proto",
+                "In": [
+                  "UDP"
+                ]
+              }
+            ],
+            "Keys": [
+              "$.event.src_ip",
+              "$.event.dest_ip",
+              "$.event.dest_port"
+            ],
+            "ValueOf": "$.event.netflow.bytes"
+          },
+          "LogFormat": "JSON",
+          "Schema": {
+            "Name": "CloudWatchLogRule",
+            "Version": 1
+          },
+          "LogGroupNames": [
+            "${FirewallFlowLogGroupName}"
+          ]
+        }
+      RuleName: !Sub TopUDPFlowsByBytesRule-${FirewallName}
+      RuleState: !Ref ContributorInsightsRuleState
+
+  # Contributor Insights Rule - Top ICMP Flows
+  TopICMPFlowsRule:
+    Type: AWS::CloudWatch::InsightRule
+    Properties:
+      RuleBody: !Sub |
+        {
+            "AggregateOn": "Count",
+            "Contribution": {
+            "Filters": [{
+              "Match": "$.event.proto",
+              "In": [
+              "ICMP"
+            ]
+            }],
+            "Keys": [
+              "$.event.src_ip",
+              "$.event.dest_ip"
+            ]
+            },
+            "LogFormat": "JSON",
+            "Schema": {
+            "Name": "CloudWatchLogRule",
+            "Version": 1
+            },
+            "LogGroupNames":[
+              "${FirewallFlowLogGroupName}"
+            ]
+        }
+      RuleName: !Sub TopICMPFlowsRule-${FirewallName}
+      RuleState: !Ref ContributorInsightsRuleState
+
+  # Contributor Insights Rule - Top Blocked Remote Access Ports
+  TopBlockedRemoteAccessPortsRule:
+    Type: AWS::CloudWatch::InsightRule
+    Properties:
+      RuleBody: !Sub |
+        {
+          "AggregateOn": "Count",
+          "Contribution": {
+            "Filters": [
+              {
+                "Match": "$.event.alert.action",
+                "In": [
+                  "blocked"
+                ]
+              },
+              {
+                "Match": "$.event.dest_port",
+                "In": [
+                  "22",
+                  "23",
+                  "3389"
+                ]
+              }
+            ],
+            "Keys": [
+              "$.event.src_ip",
+              "$.event.dest_ip",
+              "$.event.dest_port"
+            ]
+          },
+          "LogFormat": "JSON",
+          "Schema": {
+            "Name": "CloudWatchLogRule",
+            "Version": 1
+          },
+          "LogGroupNames": [
+            "${FirewallAlertLogGroupName}"
+          ]
+        }
+      RuleName: !Sub TopBlockedRemoteAccessPortsRule-${FirewallName}
+      RuleState: !Ref ContributorInsightsRuleState   
+
+  # Contributor Insights Rule - Top Blocked TCP Flows
+  TopBlockedTCPFlowsRule:
+    Type: AWS::CloudWatch::InsightRule
+    Properties:
+      RuleBody: !Sub |
+        {
+          "AggregateOn": "Count",
+          "Contribution": {
+            "Filters": [
+              {
+                "Match": "$.event.alert.action",
+                "In": [
+                  "blocked"
+                ]
+              },
+              {
+                "Match": "$.event.proto",
+                "In": [
+                  "TCP"
+                ]
+              }
+            ],
+            "Keys": [
+              "$.event.src_ip",
+              "$.event.dest_ip",
+              "$.event.dest_port"
+            ]
+          },
+          "LogFormat": "JSON",
+          "Schema": {
+            "Name": "CloudWatchLogRule",
+            "Version": 1
+          },
+          "LogGroupNames": [
+            "${FirewallAlertLogGroupName}"
+          ]
+        }
+      RuleName: !Sub TopBlockedTCPFlowsRule-${FirewallName}
+      RuleState: !Ref ContributorInsightsRuleState 
+
+  # Contributor Insights Rule - Top Blocked UDP Flows
+  TopBlockedUDPFlowsRule:
+    Type: AWS::CloudWatch::InsightRule
+    Properties:
+      RuleBody: !Sub |
+        {
+          "AggregateOn": "Count",
+          "Contribution": {
+            "Filters": [
+              {
+                "Match": "$.event.alert.action",
+                "In": [
+                  "blocked"
+                ]
+              },
+              {
+                "Match": "$.event.proto",
+                "In": [
+                  "UDP"
+                ]
+              }
+            ],
+            "Keys": [
+              "$.event.src_ip",
+              "$.event.dest_ip",
+              "$.event.dest_port"
+            ]
+          },
+          "LogFormat": "JSON",
+          "Schema": {
+            "Name": "CloudWatchLogRule",
+            "Version": 1
+          },
+          "LogGroupNames": [
+            "${FirewallAlertLogGroupName}"
+          ]
+        }
+      RuleName: !Sub TopBlockedUDPFlowsRule-${FirewallName}
+      RuleState: !Ref ContributorInsightsRuleState
+
+  # Contributor Insights Rule - Top HTTP Host Header
+  TopHTTPHostHeaderRule:
+    Type: AWS::CloudWatch::InsightRule
+    Properties:
+      RuleBody: !Sub |
+        {
+            "AggregateOn": "Count",
+            "Contribution": {
+            "Filters": [{
+              "Match": "$.event.alert.action",
+              "NotIn": [
+              "blocked"
+            ]
+            }],
+            "Keys": [
+              "$.event.http.hostname"
+            ]
+            },
+            "LogFormat": "JSON",
+            "Schema": {
+            "Name": "CloudWatchLogRule",
+            "Version": 1
+            },
+            "LogGroupNames":[
+              "${FirewallAlertLogGroupName}"
+            ]
+        }
+      RuleName: !Sub TopHTTPHostHeaderRule-${FirewallName}
+      RuleState: !Ref ContributorInsightsRuleState 
+
+  # Contributor Insights Rule - Top Blocked HTTP Host Header
+  TopBlockedHTTPHostHeaderRule:
+    Type: AWS::CloudWatch::InsightRule
+    Properties:
+      RuleBody: !Sub |
+        {
+            "AggregateOn": "Count",
+            "Contribution": {
+            "Filters": [{
+              "Match": "$.event.alert.action",
+              "In": [
+              "blocked"
+            ]
+            }],
+            "Keys": [
+              "$.event.http.hostname"
+            ]
+            },
+            "LogFormat": "JSON",
+            "Schema": {
+            "Name": "CloudWatchLogRule",
+            "Version": 1
+            },
+            "LogGroupNames":[
+              "${FirewallAlertLogGroupName}"
+            ]
+        }
+      RuleName: !Sub TopBlockedHTTPHostHeaderRule-${FirewallName}
+      RuleState: !Ref ContributorInsightsRuleState
+
+  # Contributor Insights Rule - Top HTTP URI Paths
+  TopHTTPURIPathsRule:
+    Type: AWS::CloudWatch::InsightRule
+    Properties:
+      RuleBody: !Sub |
+        {
+          "AggregateOn": "Count",
+          "Contribution": {
+            "Filters": [],
+            "Keys": [
+              "$.event.http.url"
+            ]
+          },
+          "LogFormat": "JSON",
+          "Schema": {
+            "Name": "CloudWatchLogRule",
+            "Version": 1
+          },
+          "LogGroupNames": [
+            "${FirewallAlertLogGroupName}"
+          ]
+        }
+      RuleName: !Sub TopHTTPURIPathsRule-${FirewallName}
+      RuleState: !Ref ContributorInsightsRuleState
+
+  # Contributor Insights Rule - Top HTTP User-Agents
+  TopHTTPUserAgentsRule:
+    Type: AWS::CloudWatch::InsightRule
+    Properties:
+      RuleBody: !Sub |
+        {
+          "AggregateOn": "Count",
+          "Contribution": {
+            "Filters": [],
+            "Keys": [
+              "$.event.http.http_user_agent"
+            ]
+          },
+          "LogFormat": "JSON",
+          "Schema": {
+            "Name": "CloudWatchLogRule",
+            "Version": 1
+          },
+          "LogGroupNames": [
+            "${FirewallAlertLogGroupName}"
+          ]
+        }
+      RuleName: !Sub TopHTTPUserAgentsRule-${FirewallName}
+      RuleState: !Ref ContributorInsightsRuleState
+
+  # Contributor Insights Rule - Top TLS SNI
+  TopTLSSNIRule:
+    Type: AWS::CloudWatch::InsightRule
+    Properties:
+      RuleBody: !Sub |
+        {
+            "AggregateOn": "Count",
+            "Contribution": {
+            "Filters": [{
+              "Match": "$.event.alert.action",
+              "NotIn": [
+              "blocked"
+            ]
+            }],
+            "Keys": [
+              "$.event.tls.sni"
+            ]
+            },
+            "LogFormat": "JSON",
+            "Schema": {
+            "Name": "CloudWatchLogRule",
+            "Version": 1
+            },
+            "LogGroupNames":[
+              "${FirewallAlertLogGroupName}"
+            ]
+        }
+      RuleName: !Sub TopTLSSNIRule-${FirewallName}
+      RuleState: !Ref ContributorInsightsRuleState   
+
+  # Contributor Insights Rule - Top Blocked TLS SNI
+  TopBlockedTLSSNIRule:
+    Type: AWS::CloudWatch::InsightRule
+    Properties:
+      RuleBody: !Sub |
+        {
+            "AggregateOn": "Count",
+            "Contribution": {
+            "Filters": [{
+              "Match": "$.event.alert.action",
+              "In": [
+              "blocked"
+            ]
+            }],
+            "Keys": [
+              "$.event.tls.sni"
+            ]
+            },
+            "LogFormat": "JSON",
+            "Schema": {
+            "Name": "CloudWatchLogRule",
+            "Version": 1
+            },
+            "LogGroupNames":[
+              "${FirewallAlertLogGroupName}"
+            ]
+        }
+      RuleName: !Sub TopBlockedTLSSNIRule-${FirewallName}
+      RuleState: !Ref ContributorInsightsRuleState
+
+    
+  ##### CloudWatch Dashboard #####
+
+  # CloudWatch Dashboard Body with Metrics, Contribtor Insights rules, and Logs Insights Queries
+  FirewallDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardBody:
+        Fn::Sub:
+        - |
+          {
+              "widgets": [
+                  {
+                      "height": 2,
+                      "width": 24,
+                      "y": 0,
+                      "x": 0,
+                      "type": "text",
+                      "properties": {
+                          "markdown": "# Overview\n[button:primary:Firewall Console](https://${AWS::Region}.console.aws.amazon.com/vpc/home?region=${AWS::Region}#NetworkFirewallDetails:arn=arn_aws_network-firewall_${AWS::Region}_${AWS::AccountId}_firewall~${FirewallName}) [button:Troubleshooting](https://docs.aws.amazon.com/network-firewall/latest/developerguide/troubleshooting.html) [button:re&#58;Post](https://repost.aws/search/content?globalSearch=network%20firewall)",
+                          "background": "transparent"
+                      }
+                  },
+                  {
+                      "height": 1,
+                      "width": 24,
+                      "y": 2,
+                      "x": 0,
+                      "type": "text",
+                      "properties": {
+                          "markdown": "# Firewall Endpoints",
+                          "background": "transparent"
+                      }
+                  },        
+                  {
+                      "height": 7,
+                      "width": 6,
+                      "y": 3,
+                      "x": 0,
+                      "type": "metric",
+                      "properties": {
+                          "metrics": [
+                              [ { "expression": "SEARCH(' Namespace=\"AWS/PrivateLinkEndpoints\" ${subnet_query_string}', 'Sum', 300)", "label": "${!PROP('Dim.VPC Endpoint Id')}  ${!PROP('MetricName')}", "id": "e1", "region": "${AWS::Region}" } ]
+                          ],
+                          "view": "timeSeries",
+                          "stacked": false,
+                          "region": "${AWS::Region}",
+                          "stat": "Sum",
+                          "period": 300,
+                          "title": "Firewall Endpoint ENI (GWLBe/VPCe) Metrics",
+                          "legend": {
+                              "position": "bottom"
+                          }
+                      }
+                  },
+                  {
+                      "height": 7,
+                      "width": 6,
+                      "y": 3,
+                      "x": 6,
+                      "type": "metric",
+                      "properties": {
+                          "metrics": [
+                              [ { "expression": "((m1/300)/.008)", "label": "${!PROP('Dim.VPC Endpoint Id')}", "id": "e1", "period": 300, "stat": "Sum", "region": "${AWS::Region}" } ],
+                              [ { "expression": "SEARCH('Namespace=\"AWS/PrivateLinkEndpoints\" ${subnet_query_string} MetricName=\"BytesProcessed\"', 'Sum', 300)", "label": "Expression1", "id": "m1", "region": "${AWS::Region}", "visible": false } ]
+                          ],
+                          "view": "gauge",
+                          "stacked": true,
+                          "region": "${AWS::Region}",
+                          "stat": "Sum",
+                          "period": 60,
+                          "title": "Per Endpoint Utilization Gbps",
+                          "yAxis": {
+                              "left": {
+                                  "min": 0,
+                                  "max": 100000000000
+                              }
+                          },
+                          "setPeriodToTimeRange": false,
+                          "sparkline": true,
+                          "trend": true
+                      }
+                  },
+                  {
+                      "height": 7,
+                      "width": 6,
+                      "y": 3,
+                      "x": 12,
+                      "type": "metric",
+                      "properties": {
+                          "metrics": [
+                              [ { "expression": "SEARCH('Namespace=\"AWS/PrivateLinkEndpoints\" ${subnet_query_string} MetricName=\"ActiveConnections\"', 'Sum', 300)", "label": "${!PROP('Dim.VPC Endpoint Id')}  ${!PROP('MetricName')}", "id": "m1", "region": "${AWS::Region}", "visible": true } ]
+                          ],
+                          "sparkline": true,
+                          "view": "singleValue",
+                          "region": "${AWS::Region}",
+                          "period": 300,
+                          "stat": "Sum",
+                          "title": "ActiveConnections"
+                      }
+                  },
+                  {
+                      "height": 7,
+                      "width": 6,
+                      "y": 3,
+                      "x": 18,
+                      "type": "metric",
+                      "properties": {
+                          "metrics": [
+                              [ { "expression": "SEARCH('Namespace=\"AWS/PrivateLinkEndpoints\" ${subnet_query_string} MetricName=\"BytesProcessed\"', 'Sum', 300)", "label": "${!PROP('Dim.VPC Endpoint Id')}  ${!PROP('MetricName')}", "id": "m2", "region": "${AWS::Region}", "visible": true } ]
+                          ],
+                          "sparkline": true,
+                          "view": "singleValue",
+                          "region": "${AWS::Region}",
+                          "period": 300,
+                          "stat": "Sum",
+                          "title": "BytesProcessed"
+                      }
+                  },
+                  {
+                      "height": 1,
+                      "width": 24,
+                      "y": 10,
+                      "x": 0,
+                      "type": "text",
+                      "properties": {
+                          "markdown": "# Firewall Engines",
+                          "background": "transparent"
+                      }
+                  },
+                  {
+                      "height": 1,
+                      "width": 24,
+                      "y": 11,
+                      "x": 0,
+                      "type": "text",
+                      "properties": {
+                          "markdown": "## Stateless",
+                          "background": "transparent"
+                      }
+                  },        
+                  {
+                      "height": 7,
+                      "width": 6,
+                      "y": 12,
+                      "x": 0,
+                      "type": "metric",
+                      "properties": {
+                          "metrics": [
+                              [ { "expression": "SEARCH('Namespace=\"AWS/NetworkFirewall\" FirewallName=\"${FirewallName}\" Engine=\"Stateless\"', 'Sum')", "label": "", "id": "e1", "region": "${AWS::Region}" } ]
+                          ],
+                          "view": "timeSeries",
+                          "stacked": false,
+                          "region": "${AWS::Region}",
+                          "stat": "Sum",
+                          "period": 300,
+                          "title": "Stateless Engine Metrics",
+                          "legend": {
+                              "position": "bottom"
+                          }
+                      }
+                  },
+                  {
+                      "height": 7,
+                      "width": 6,
+                      "y": 12,
+                      "x": 6,
+                      "type": "metric",
+                      "properties": {
+                          "metrics": [
+                              [ { "expression": "SEARCH('Namespace=\"AWS/NetworkFirewall\" FirewallName=\"${FirewallName}\" Engine=\"Stateless\" MetricName=\"PassedPackets\"', 'Sum', 300)", "label": "${!PROP('Dim.AvailabilityZone')} ${!PROP('MetricName')}", "id": "e1", "region": "${AWS::Region}" } ]
+                          ],
+                          "sparkline": true,
+                          "view": "singleValue",
+                          "region": "${AWS::Region}",
+                          "title": "Stateless Passed Packets",
+                          "period": 300,
+                          "stat": "Sum"
+                      }
+                  },
+                  {
+                      "height": 7,
+                      "width": 6,
+                      "y": 12,
+                      "x": 12,
+                      "type": "metric",
+                      "properties": {
+                          "metrics": [
+                              [ { "expression": "SEARCH('Namespace=\"AWS/NetworkFirewall\" FirewallName=\"${FirewallName}\" Engine=\"Stateless\" MetricName=\"DroppedPackets\"', 'Sum', 300)", "label": "${!PROP('Dim.AvailabilityZone')} ${!PROP('MetricName')}", "id": "e1", "region": "${AWS::Region}" } ]
+                          ],
+                          "sparkline": true,
+                          "view": "singleValue",
+                          "region": "${AWS::Region}",
+                          "title": "Stateless Dropped Packets - Rule Action",
+                          "period": 300,
+                          "stat": "Sum"
+                      }
+                  },
+                  {
+                      "height": 7,
+                      "width": 6,
+                      "y": 12,
+                      "x": 18,
+                      "type": "metric",
+                      "properties": {
+                          "metrics": [
+                              [ { "expression": "SEARCH('Namespace=\"AWS/NetworkFirewall\" FirewallName=\"${FirewallName}\" Engine=\"Stateless\" MetricName=Other OR Invalid', 'Sum', 300)", "label": "${!PROP('Dim.AvailabilityZone')} ${!PROP('MetricName')}", "id": "e1", "region": "${AWS::Region}" } ]
+                          ],
+                          "sparkline": true,
+                          "view": "singleValue",
+                          "region": "${AWS::Region}",
+                          "title": "Stateless Dropped Packets - Other",
+                          "period": 300,
+                          "stat": "Sum"
+                      }
+                  },
+                  {
+                      "height": 1,
+                      "width": 24,
+                      "y": 19,
+                      "x": 0,
+                      "type": "text",
+                      "properties": {
+                          "markdown": "## Stateful\n",
+                          "background": "transparent"
+                      }
+                  },
+                  {
+                      "height": 7,
+                      "width": 6,
+                      "y": 20,
+                      "x": 0,
+                      "type": "metric",
+                      "properties": {
+                          "metrics": [
+                              [ { "expression": "SEARCH('Namespace=\"AWS/NetworkFirewall\" FirewallName=\"${FirewallName}\" Engine=\"Stateful\"', 'Sum')", "label": "", "id": "e1", "region": "${AWS::Region}" } ]
+                          ],
+                          "view": "timeSeries",
+                          "stacked": false,
+                          "region": "${AWS::Region}",
+                          "stat": "Sum",
+                          "period": 300,
+                          "title": "Stateful Engine Metrics"
+                      }
+                  },
+                  {
+                      "height": 7,
+                      "width": 6,
+                      "y": 20,
+                      "x": 6,
+                      "type": "metric",
+                      "properties": {
+                          "metrics": [
+                              [ { "expression": "SEARCH('Namespace=\"AWS/NetworkFirewall\" FirewallName=\"${FirewallName}\" Engine=\"Stateful\" MetricName=\"PassedPackets\"', 'Sum', 300)", "label": "${!PROP('Dim.AvailabilityZone')} ${!PROP('MetricName')}", "id": "e1", "region": "${AWS::Region}" } ]
+                          ],
+                          "sparkline": true,
+                          "view": "singleValue",
+                          "region": "${AWS::Region}",
+                          "period": 300,
+                          "stat": "Sum",
+                          "title": "Stateful Passed Packets"
+                      }
+                  },
+                  {
+                      "height": 7,
+                      "width": 6,
+                      "y": 20,
+                      "x": 12,
+                      "type": "metric",
+                      "properties": {
+                          "metrics": [
+                              [ { "expression": "SEARCH('Namespace=\"AWS/NetworkFirewall\" FirewallName=\"${FirewallName}\" Engine=\"Stateful\" MetricName=\"DroppedPackets\"', 'Sum', 300)", "label": "${!PROP('Dim.AvailabilityZone')} ${!PROP('MetricName')}", "id": "e1", "region": "${AWS::Region}" } ]
+                          ],
+                          "sparkline": true,
+                          "view": "singleValue",
+                          "region": "${AWS::Region}",
+                          "period": 300,
+                          "stat": "Sum",
+                          "title": "Stateful Dropped Packets"
+                      }
+                  },
+                  {
+                      "height": 7,
+                      "width": 6,
+                      "y": 20,
+                      "x": 18,
+                      "type": "metric",
+                      "properties": {
+                          "metrics": [
+                              [ { "expression": "SEARCH('Namespace=\"AWS/NetworkFirewall\" FirewallName=\"${FirewallName}\" Engine=\"Stateful\" MetricName=\"RejectedPackets\"', 'Sum', 300)", "label": "${!PROP('Dim.AvailabilityZone')} ${!PROP('MetricName')}", "id": "e1", "region": "${AWS::Region}" } ]
+                          ],
+                          "sparkline": true,
+                          "view": "singleValue",
+                          "region": "${AWS::Region}",
+                          "period": 300,
+                          "stat": "Sum",
+                          "title": "Stateful Rejected Packets"
+                      }
+                  },
+                  {
+                      "height": 7,
+                      "width": 6,
+                      "y": 27,
+                      "x": 0,
+                      "type": "metric",
+                      "properties": {
+                          "metrics": [
+                              [ { "expression": "SEARCH('Namespace=\"AWS/NetworkFirewall\" FirewallName=\"${FirewallName}\" MetricName=TLS', 'Sum', 300)", "label": "${!PROP('Dim.AvailabilityZone')} ${!PROP('MetricName')}", "id": "e1", "region": "${AWS::Region}" } ]
+                          ],
+                          "view": "timeSeries",
+                          "stacked": false,
+                          "region": "${AWS::Region}",
+                          "stat": "Sum",
+                          "period": 300,
+                          "title": "TLS Inspection"
+                      }
+                  },
+                  {
+                      "height": 7,
+                      "width": 6,
+                      "y": 27,
+                      "x": 6,
+                      "type": "metric",
+                      "properties": {
+                          "metrics": [
+                              [ { "expression": "SEARCH('Namespace=\"AWS/NetworkFirewall\" FirewallName=\"${FirewallName}\" MetricName=\"StreamExceptionPolicyPackets\"', 'Sum', 300)", "label": "${!PROP('Dim.AvailabilityZone')} ${!PROP('MetricName')}", "id": "e1", "region": "${AWS::Region}" } ]
+                          ],
+                          "view": "timeSeries",
+                          "stacked": false,
+                          "region": "${AWS::Region}",
+                          "stat": "Sum",
+                          "period": 300,
+                          "title": "Stream Exception Policy Packets"
+                      }
+                  },
+                  {
+                      "height": 7,
+                      "width": 6,
+                      "y": 27,
+                      "x": 12,
+                      "type": "metric",
+                      "properties": {
+                          "period": 60,
+                          "insightRule": {
+                              "maxContributorCount": 10,
+                              "orderBy": "Sum",
+                              "ruleName": "${TopLongLivedTCPFlowsRule.RuleName}"
+                          },
+                          "stacked": false,
+                          "view": "timeSeries",
+                          "yAxis": {
+                              "left": {
+                                  "showUnits": false
+                              },
+                              "right": {
+                                  "showUnits": false
+                              }
+                          },
+                          "region": "${AWS::Region}",
+                          "title": "Top Long-Lived TCP Flows - Age > 350s",
+                          "legend": {
+                              "position": "right"
+                          }
+                      }
+                  },
+                  {
+                      "height": 7,
+                      "width": 6,
+                      "y": 27,
+                      "x": 18,
+                      "type": "metric",
+                      "properties": {
+                          "period": 60,
+                          "insightRule": {
+                              "maxContributorCount": 10,
+                              "orderBy": "Sum",
+                              "ruleName": "${TopTCPSYNWithoutSYNACKRule.RuleName}"
+                          },
+                          "stacked": false,
+                          "view": "timeSeries",
+                          "yAxis": {
+                              "left": {
+                                  "showUnits": false
+                              },
+                              "right": {
+                                  "showUnits": false
+                              }
+                          },
+                          "region": "${AWS::Region}",
+                          "title": "Top TCP Flows - SYN Without SYN-ACK",
+                          "legend": {
+                              "position": "right"
+                          }
+                      }
+                  },
+                  {
+                      "height": 1,
+                      "width": 24,
+                      "y": 34,
+                      "x": 0,
+                      "type": "text",
+                      "properties": {
+                          "markdown": "# Top Talkers\n",
+                          "background": "transparent"
+                      }
+                  },
+                  {
+                      "height": 7,
+                      "width": 6,
+                      "y": 35,
+                      "x": 0,
+                      "type": "metric",
+                      "properties": {
+                          "period": 60,
+                          "region": "${AWS::Region}",
+                          "stacked": false,
+                          "timezone": "local",
+                          "title": "Top Source IP by Packets",
+                          "view": "timeSeries",
+                          "legend": {
+                              "position": "right"
+                          },
+                          "insightRule": {
+                              "maxContributorCount": 10,
+                              "orderBy": "Sum",
+                              "ruleName": "${TopSourceIPByPacketsRule.RuleName}"
+                          }
+                      }
+                  },
+                  {
+                      "height": 7,
+                      "width": 6,
+                      "y": 35,
+                      "x": 6,
+                      "type": "metric",
+                      "properties": {
+                          "period": 60,
+                          "region": "${AWS::Region}",
+                          "stacked": false,
+                          "timezone": "local",
+                          "title": "Top Source IP by Bytes",
+                          "view": "timeSeries",
+                          "legend": {
+                              "position": "right"
+                          },
+                          "insightRule": {
+                              "maxContributorCount": 10,
+                              "orderBy": "Sum",
+                              "ruleName": "${TopSourceIPByBytesRule.RuleName}"
+                          }
+                      }
+                  },
+                  {
+                      "height": 7,
+                      "width": 6,
+                      "y": 35,
+                      "x": 12,
+                      "type": "metric",
+                      "properties": {
+                          "period": 60,
+                          "region": "${AWS::Region}",
+                          "stacked": false,
+                          "timezone": "local",
+                          "title": "Top Destination IP by Packets",
+                          "view": "timeSeries",
+                          "legend": {
+                              "position": "right"
+                          },
+                          "insightRule": {
+                              "maxContributorCount": 10,
+                              "orderBy": "Sum",
+                              "ruleName": "${TopDestinationIPByPacketsRule.RuleName}"
+                          }
+                      }
+                  },
+                  {
+                      "height": 7,
+                      "width": 6,
+                      "y": 35,
+                      "x": 18,
+                      "type": "metric",
+                      "properties": {
+                          "period": 60,
+                          "region": "${AWS::Region}",
+                          "stacked": false,
+                          "timezone": "local",
+                          "title": "Top Destination IP by Bytes",
+                          "view": "timeSeries",
+                          "legend": {
+                              "position": "right"
+                          },
+                          "insightRule": {
+                              "maxContributorCount": 10,
+                              "orderBy": "Sum",
+                              "ruleName": "${TopDestinationIPByBytesRule.RuleName}"
+                          }
+                      }
+                  },
+                  {
+                      "height": 7,
+                      "width": 12,
+                      "y": 42,
+                      "x": 0,
+                      "type": "metric",
+                      "properties": {
+                          "period": 60,
+                          "region": "${AWS::Region}",
+                          "stacked": false,
+                          "timezone": "local",
+                          "title": "Top Source and Destination IP by Packets",
+                          "view": "timeSeries",
+                          "legend": {
+                              "position": "right"
+                          },
+                          "insightRule": {
+                              "maxContributorCount": 10,
+                              "orderBy": "Sum",
+                              "ruleName": "${TopSourceAndDestinationIPByPacketsRule.RuleName}"
+                          }
+                      }
+                  },
+                  {
+                      "height": 7,
+                      "width": 12,
+                      "y": 42,
+                      "x": 12,
+                      "type": "metric",
+                      "properties": {
+                          "period": 60,
+                          "insightRule": {
+                              "maxContributorCount": 10,
+                              "orderBy": "Sum",
+                              "ruleName": "${TopSourceAndDestinationIPByBytesRule.RuleName}"
+                          },
+                          "stacked": false,
+                          "view": "timeSeries",
+                          "yAxis": {
+                              "left": {
+                                  "showUnits": false
+                              },
+                              "right": {
+                                  "showUnits": false
+                              }
+                          },
+                          "region": "${AWS::Region}",
+                          "title": "Top Source and Destination IP by Bytes",
+                          "legend": {
+                              "position": "right"
+                          }
+                      }
+                  },
+                  {
+                      "height": 1,
+                      "width": 24,
+                      "y": 49,
+                      "x": 0,
+                      "type": "text",
+                      "properties": {
+                          "markdown": "# Top Protocols",
+                          "background": "transparent"
+                      }
+                  },
+                  {
+                      "height": 7,
+                      "width": 6,
+                      "y": 50,
+                      "x": 0,
+                      "type": "log",
+                      "properties": {
+                          "query": "SOURCE '${FirewallFlowLogGroupName}' | stats count() as proto by event.proto\n| sort proto desc\n| limit 10",
+                          "region": "${AWS::Region}",
+                          "stacked": false,
+                          "title": "Top Protocols",
+                          "view": "pie"
+                      }
+                  },
+                  {
+                      "height": 7,
+                      "width": 6,
+                      "y": 50,
+                      "x": 6,
+                      "type": "log",
+                      "properties": {
+                          "query": "SOURCE '${FirewallFlowLogGroupName}' | stats count() as app_proto by event.app_proto\n| sort app_proto desc\n| limit 10",
+                          "region": "${AWS::Region}",
+                          "stacked": false,
+                          "view": "pie",
+                          "title": "Top Application Layer Protocols Detected"
+                      }
+                  },
+                  {
+                      "height": 7,
+                      "width": 6,
+                      "y": 50,
+                      "x": 12,
+                      "type": "metric",
+                      "properties": {
+                          "period": 60,
+                          "region": "${AWS::Region}",
+                          "stacked": false,
+                          "timezone": "local",
+                          "title": "Top Source Port",
+                          "view": "timeSeries",
+                          "legend": {
+                              "position": "right"
+                          },
+                          "insightRule": {
+                              "maxContributorCount": 10,
+                              "orderBy": "Sum",
+                              "ruleName": "${TopSourcePortsRule.RuleName}"
+                          }
+                      }
+                  },
+                  {
+                      "height": 7,
+                      "width": 6,
+                      "y": 50,
+                      "x": 18,
+                      "type": "metric",
+                      "properties": {
+                          "period": 60,
+                          "region": "${AWS::Region}",
+                          "stacked": false,
+                          "timezone": "local",
+                          "title": "Top Destination Port",
+                          "view": "timeSeries",
+                          "legend": {
+                              "position": "right"
+                          },
+                          "insightRule": {
+                              "maxContributorCount": 10,
+                              "orderBy": "Sum",
+                              "ruleName": "${TopDestinationPortsRule.RuleName}"
+                          }
+                      }
+                  },
+                  {
+                      "height": 7,
+                      "width": 6,
+                      "y": 57,
+                      "x": 0,
+                      "type": "metric",
+                      "properties": {
+                          "period": 60,
+                          "insightRule": {
+                              "maxContributorCount": 10,
+                              "orderBy": "Sum",
+                              "ruleName": "${TopTCPFlowsRule.RuleName}"
+                          },
+                          "stacked": false,
+                          "view": "timeSeries",
+                          "yAxis": {
+                              "left": {
+                                  "showUnits": false
+                              },
+                              "right": {
+                                  "showUnits": false
+                              }
+                          },
+                          "region": "${AWS::Region}",
+                          "title": "Top TCP Flows",
+                          "legend": {
+                              "position": "right"
+                          }
+                      }
+                  },
+                  {
+                      "height": 7,
+                      "width": 6,
+                      "y": 57,
+                      "x": 6,
+                      "type": "metric",
+                      "properties": {
+                          "period": 60,
+                          "insightRule": {
+                              "maxContributorCount": 10,
+                              "orderBy": "Sum",
+                              "ruleName": "${TopTCPFlowsByPacketsRule.RuleName}"
+                          },
+                          "stacked": false,
+                          "view": "timeSeries",
+                          "yAxis": {
+                              "left": {
+                                  "showUnits": false
+                              },
+                              "right": {
+                                  "showUnits": false
+                              }
+                          },
+                          "region": "${AWS::Region}",
+                          "title": "Top TCP Flows by Packets",
+                          "legend": {
+                              "position": "right"
+                          }
+                      }
+                  },
+                  {
+                      "height": 7,
+                      "width": 6,
+                      "y": 57,
+                      "x": 12,
+                      "type": "metric",
+                      "properties": {
+                          "period": 60,
+                          "insightRule": {
+                              "maxContributorCount": 10,
+                              "orderBy": "Sum",
+                              "ruleName": "${TopTCPFlowsByBytesRule.RuleName}"
+                          },
+                          "stacked": false,
+                          "view": "timeSeries",
+                          "yAxis": {
+                              "left": {
+                                  "showUnits": false
+                              },
+                              "right": {
+                                  "showUnits": false
+                              }
+                          },
+                          "region": "${AWS::Region}",
+                          "title": "Top TCP Flows by Bytes",
+                          "legend": {
+                              "position": "right"
+                          }
+                      }
+                  },
+                  {
+                      "height": 7,
+                      "width": 6,
+                      "y": 57,
+                      "x": 18,
+                      "type": "log",
+                      "properties": {
+                          "query": "SOURCE '${FirewallFlowLogGroupName}' | stats count() as tcp_flags by event.tcp.tcp_flags\n| sort tcp_flags desc\n| limit 10",
+                          "region": "${AWS::Region}",
+                          "title": "Top TCP Flags",
+                          "view": "pie"
+                      }
+                  },
+                  {
+                      "height": 7,
+                      "width": 6,
+                      "y": 64,
+                      "x": 0,
+                      "type": "metric",
+                      "properties": {
+                          "period": 60,
+                          "region": "${AWS::Region}",
+                          "stacked": false,
+                          "timezone": "local",
+                          "title": "Top UDP Flows",
+                          "view": "timeSeries",
+                          "legend": {
+                              "position": "right"
+                          },
+                          "insightRule": {
+                              "maxContributorCount": 10,
+                              "orderBy": "Sum",
+                              "ruleName": "${TopUDPFlowsRule.RuleName}"
+                          }
+                      }
+                  },
+                  {
+                      "height": 7,
+                      "width": 6,
+                      "y": 64,
+                      "x": 6,
+                      "type": "metric",
+                      "properties": {
+                          "period": 60,
+                          "region": "${AWS::Region}",
+                          "stacked": false,
+                          "timezone": "local",
+                          "title": "Top UDP Flows by Packets",
+                          "view": "timeSeries",
+                          "legend": {
+                              "position": "right"
+                          },
+                          "insightRule": {
+                              "maxContributorCount": 10,
+                              "orderBy": "Sum",
+                              "ruleName": "${TopUDPFlowsByPacketsRule.RuleName}"
+                          }
+                      }
+                  },
+                  {
+                      "height": 7,
+                      "width": 6,
+                      "y": 64,
+                      "x": 12,
+                      "type": "metric",
+                      "properties": {
+                          "period": 60,
+                          "region": "${AWS::Region}",
+                          "stacked": false,
+                          "timezone": "local",
+                          "title": "Top UDP Flows by Bytes",
+                          "view": "timeSeries",
+                          "legend": {
+                              "position": "right"
+                          },
+                          "insightRule": {
+                              "maxContributorCount": 10,
+                              "orderBy": "Sum",
+                              "ruleName": "${TopUDPFlowsByBytesRule.RuleName}"
+                          }
+                      }
+                  },
+                  {
+                      "height": 7,
+                      "width": 6,
+                      "y": 64,
+                      "x": 18,
+                      "type": "metric",
+                      "properties": {
+                          "period": 60,
+                          "region": "${AWS::Region}",
+                          "stacked": false,
+                          "timezone": "local",
+                          "title": "Top ICMP Flows",
+                          "view": "timeSeries",
+                          "legend": {
+                              "position": "right"
+                          },
+                          "insightRule": {
+                              "maxContributorCount": 10,
+                              "orderBy": "Sum",
+                              "ruleName": "${TopICMPFlowsRule.RuleName}"
+                          }
+                      }
+                  },
+                  {
+                      "height": 1,
+                      "width": 24,
+                      "y": 71,
+                      "x": 0,
+                      "type": "text",
+                      "properties": {
+                          "markdown": "# Alert Log Analysis",
+                          "background": "transparent"
+                      }
+                  },
+                  {
+                      "height": 1,
+                      "width": 24,
+                      "y": 72,
+                      "x": 0,
+                      "type": "text",
+                      "properties": {
+                          "markdown": "## Rule Summary",
+                          "background": "transparent"
+                      }
+                  },
+                  {
+                      "height": 7,
+                      "width": 6,
+                      "y": 73,
+                      "x": 0,
+                      "type": "log",
+                      "properties": {
+                          "query": "SOURCE '${FirewallAlertLogGroupName}' | stats count (*) as Count by event.alert.signature_id as SID, event.alert.action as Action, event.alert.signature as Message, event.proto as Proto\n| display SID, Action, Message, Proto, Count\n| filter event.alert.action = 'blocked'\n| sort Count desc\n| limit 10",
+                          "region": "${AWS::Region}",
+                          "stacked": false,
+                          "title": "Top Drop/Reject Rules",
+                          "view": "table"
+                      }
+                  },
+                  {
+                      "height": 7,
+                      "width": 6,
+                      "y": 73,
+                      "x": 6,
+                      "type": "log",
+                      "properties": {
+                          "query": "SOURCE '${FirewallAlertLogGroupName}' | stats count (*) as Count by event.alert.signature_id as SID, event.alert.action as Action, event.alert.signature as Message, event.proto as Proto\n| display SID, Action, Message, Proto, Count\n| filter event.alert.action != 'blocked'\n| sort Count desc\n| limit 10",
+                          "region": "${AWS::Region}",
+                          "stacked": false,
+                          "title": "Top Alert Rules",
+                          "view": "table"
+                      }
+                  },
+                  {
+                      "height": 7,
+                      "width": 12,
+                      "y": 73,
+                      "x": 12,
+                      "type": "log",
+                      "properties": {
+                          "query": "SOURCE '${FirewallAlertLogGroupName}' | fields event.timestamp as Time, event.alert.signature_id as SID, event.alert.signature as Message, event.proto as Proto, event.src_ip as Src_IP, event.src_port as Src_Port, event.dest_ip as Dest_IP, event.dest_port as Dest_Port\n| sort event.timestamp desc\n| limit 10",
+                          "region": "${AWS::Region}",
+                          "stacked": false,
+                          "title": "Recent Alert Log Events",
+                          "view": "table"
+                      }
+                  },
+                  {
+                      "height": 7,
+                      "width": 6,
+                      "y": 80,
+                      "x": 0,
+                      "type": "log",
+                      "properties": {
+                          "query": "SOURCE '${FirewallAlertLogGroupName}' | stats count() as blocked_src_ip by event.src_ip as src_ip\n| filter event.alert.action = 'blocked'\n| sort blocked_src_ip desc\n| limit 10",
+                          "region": "${AWS::Region}",
+                          "title": "Top Blocked Source IPs",
+                          "view": "pie"
+                      }
+                  },
+                  {
+                      "height": 7,
+                      "width": 6,
+                      "y": 80,
+                      "x": 6,
+                      "type": "log",
+                      "properties": {
+                          "query": "SOURCE '${FirewallAlertLogGroupName}' | stats count() as blocked_dest_ip by event.dest_ip as dest_ip\n| filter event.alert.action = 'blocked'\n| sort blocked_dest_ip desc\n| limit 10",
+                          "region": "${AWS::Region}",
+                          "title": "Top Blocked Destination IPs",
+                          "view": "pie"
+                      }
+                  },
+                  {
+                      "height": 7,
+                      "width": 6,
+                      "y": 80,
+                      "x": 12,
+                      "type": "log",
+                      "properties": {
+                          "query": "SOURCE '${FirewallAlertLogGroupName}' | stats count() as blocked_dest_port by event.dest_port as dest_port\n| filter event.alert.action = 'blocked'\n| sort blocked_dest_port desc\n| limit 10",
+                          "region": "${AWS::Region}",
+                          "stacked": false,
+                          "title": "Top Blocked Destination Ports",
+                          "view": "pie"
+                      }
+                  },
+                  {
+                      "height": 7,
+                      "width": 6,
+                      "y": 80,
+                      "x": 18,
+                      "type": "metric",
+                      "properties": {
+                          "period": 60,
+                          "region": "${AWS::Region}",
+                          "stacked": false,
+                          "timezone": "local",
+                          "title": "Top Blocked Remote Access Ports - Telnet, SSH, RDP",
+                          "view": "timeSeries",
+                          "legend": {
+                              "position": "right"
+                          },
+                          "insightRule": {
+                              "maxContributorCount": 10,
+                              "orderBy": "Sum",
+                              "ruleName": "${TopBlockedRemoteAccessPortsRule.RuleName}"
+                          }
+                      }
+                  },
+                  {
+                      "height": 7,
+                      "width": 12,
+                      "y": 87,
+                      "x": 0,
+                      "type": "metric",
+                      "properties": {
+                          "period": 60,
+                          "region": "${AWS::Region}",
+                          "stacked": false,
+                          "timezone": "local",
+                          "title": "Top Blocked TCP Flows",
+                          "view": "timeSeries",
+                          "legend": {
+                              "position": "right"
+                          },
+                          "insightRule": {
+                              "maxContributorCount": 10,
+                              "orderBy": "Sum",
+                              "ruleName": "${TopBlockedTCPFlowsRule.RuleName}"
+                          }
+                      }
+                  },
+                  {
+                      "type": "metric",
+                      "height": 7,
+                      "width": 12,
+                      "y": 87,
+                      "x": 12,
+                      "properties": {
+                          "period": 60,
+                          "region": "${AWS::Region}",
+                          "stacked": false,
+                          "timezone": "local",
+                          "title": "Top Blocked UDP Flows",
+                          "view": "timeSeries",
+                          "legend": {
+                              "position": "right"
+                          },
+                          "insightRule": {
+                              "maxContributorCount": 10,
+                              "orderBy": "Sum",
+                              "ruleName": "${TopBlockedUDPFlowsRule.RuleName}"
+                          }
+                      }
+                  },
+                  {
+                      "height": 1,
+                      "width": 24,
+                      "y": 94,
+                      "x": 0,
+                      "type": "text",
+                      "properties": {
+                          "markdown": "## HTTP & TLS",
+                          "background": "transparent"
+                      }
+                  },
+                  {
+                      "height": 7,
+                      "width": 6,
+                      "y": 95,
+                      "x": 0,
+                      "type": "metric",
+                      "properties": {
+                          "period": 60,
+                          "region": "${AWS::Region}",
+                          "stacked": false,
+                          "timezone": "local",
+                          "title": "Top HTTP Host Header",
+                          "view": "timeSeries",
+                          "legend": {
+                              "position": "right"
+                          },
+                          "insightRule": {
+                              "maxContributorCount": 10,
+                              "orderBy": "Sum",
+                              "ruleName": "${TopHTTPHostHeaderRule.RuleName}"
+                          }
+                      }
+                  },
+                  {
+                      "height": 7,
+                      "width": 6,
+                      "y": 95,
+                      "x": 6,
+                      "type": "metric",
+                      "properties": {
+                          "period": 60,
+                          "insightRule": {
+                              "maxContributorCount": 10,
+                              "orderBy": "Sum",
+                              "ruleName": "${TopBlockedHTTPHostHeaderRule.RuleName}"
+                          },
+                          "stacked": false,
+                          "view": "timeSeries",
+                          "yAxis": {
+                              "left": {
+                                  "showUnits": false
+                              },
+                              "right": {
+                                  "showUnits": false
+                              }
+                          },
+                          "region": "${AWS::Region}",
+                          "title": "Top Blocked HTTP Host Header",
+                          "legend": {
+                              "position": "right"
+                          }
+                      }
+                  },
+                  {
+                      "height": 7,
+                      "width": 6,
+                      "y": 95,
+                      "x": 12,
+                      "type": "metric",
+                      "properties": {
+                          "period": 60,
+                          "region": "${AWS::Region}",
+                          "stacked": false,
+                          "timezone": "local",
+                          "title": "Top HTTP URI Paths",
+                          "view": "timeSeries",
+                          "legend": {
+                              "position": "right"
+                          },
+                          "insightRule": {
+                              "maxContributorCount": 10,
+                              "orderBy": "Sum",
+                              "ruleName": "${TopHTTPURIPathsRule.RuleName}"
+                          }
+                      }
+                  },
+                  {
+                      "height": 7,
+                      "width": 6,
+                      "y": 95,
+                      "x": 18,
+                      "type": "metric",
+                      "properties": {
+                          "period": 60,
+                          "region": "${AWS::Region}",
+                          "stacked": false,
+                          "timezone": "local",
+                          "title": "Top HTTP User-Agents",
+                          "view": "timeSeries",
+                          "legend": {
+                              "position": "right"
+                          },
+                          "insightRule": {
+                              "maxContributorCount": 10,
+                              "orderBy": "Sum",
+                              "ruleName": "${TopHTTPUserAgentsRule.RuleName}"
+                          }
+                      }
+                  },
+                  {
+                      "height": 7,
+                      "width": 6,
+                      "y": 102,
+                      "x": 0,
+                      "type": "metric",
+                      "properties": {
+                          "period": 60,
+                          "region": "${AWS::Region}",
+                          "stacked": false,
+                          "timezone": "local",
+                          "title": "Top TLS SNI",
+                          "view": "timeSeries",
+                          "legend": {
+                              "position": "right"
+                          },
+                          "insightRule": {
+                              "maxContributorCount": 10,
+                              "orderBy": "Sum",
+                              "ruleName": "${TopTLSSNIRule.RuleName}"
+                          }
+                      }
+                  },
+                  {
+                      "height": 7,
+                      "width": 6,
+                      "y": 102,
+                      "x": 6,
+                      "type": "metric",
+                      "properties": {
+                          "period": 60,
+                          "insightRule": {
+                              "maxContributorCount": 10,
+                              "orderBy": "Sum",
+                              "ruleName": "${TopBlockedTLSSNIRule.RuleName}"
+                          },
+                          "stacked": false,
+                          "view": "timeSeries",
+                          "yAxis": {
+                              "left": {
+                                  "showUnits": false
+                              },
+                              "right": {
+                                  "showUnits": false
+                              }
+                          },
+                          "region": "${AWS::Region}",
+                          "title": "Top Blocked TLS SNI",
+                          "legend": {
+                              "position": "right"
+                          }
+                      }
+                  },
+                  {
+                      "height": 7,
+                      "width": 12,
+                      "y": 102,
+                      "x": 12,
+                      "type": "log",
+                      "properties": {
+                          "query": "SOURCE '${FirewallAlertLogGroupName}' | stats count(*) as Count by event.src_ip as Source_IP, event.dest_ip as Dest_IP, event.app_proto as App_Proto, event.tls.sni as SNI, event.http.hostname as Hostname\n| filter event.tls.sni like \"s3\" or event.http.hostname like \"s3\" or event.tls.sni like \"dynamodb\" or event.http.hostname like \"dynamodb\" or event.tls.sni like \"backup\" or event.http.hostname like \"backup\"\n| display Source_IP, Dest_IP, App_Proto, SNI, Hostname, Count\n| sort Count desc\n| limit 10",
+                          "region": "${AWS::Region}",
+                          "title": "Top PrivateLink Endpoint Candidates (S3, DynamoDB, & Backup)",
+                          "view": "table"
+                      }
+                    },
+                    {
+                      "height": 1,
+                      "width": 24,
+                      "y": 109,
+                      "x": 0,
+                      "type": "text",
+                      "properties": {
+                          "markdown": "## Generative AI",
+                          "background": "transparent"
+                      }
+                  },
+                  {
+                      "type": "custom",
+                      "x": 0,
+                      "y": 110,
+                      "width": 24,
+                      "height": 6,
+                      "properties": {
+                        "endpoint": "${BedrockLogCWFunctionArn}",
+                        "title": "Using AI in Log Analysis",
+                        "params": {
+                          "log_group_arn": {
+                            "type": "text",
+                            "label": "Log Group ARN",
+                            "default": "${FirewallAlertLogGroupName}"
+                          },
+                          "custom_prompt": {
+                            "type": "text",
+                            "label": "Your Prompt",
+                            "default": ""
+                          }
+                        },
+                        "updateOn": {
+                          "refresh": true,
+                          "timeRange": true
+                        }
+                      }
+                    }
+                  ]
+                }
+        - subnet_query_string: !GetAtt GenerateSubnetQueryStringCustomResource.SubnetQueryString
+          BedrockLogCWFunctionArn: !GetAtt BedrockLogCWFunction.Arn
+          FirewallAlertLogGroupName: !Ref FirewallAlertLogGroupName  
+      DashboardName: !Sub  ${FirewallName}-dashboard
+
+Outputs:
+
+  FirewallEndpoints:
+    Description: "Network Firewall Endpoints"
+    Value: !Join [ ",", !GetAtt NetworkFirewall.EndpointIds ]
+
+  InstanceIDs:
+    Description: "EC2 Instance IDs"
+    Value:
+      !Join
+        - ','
+        - - !Ref Instance1AZ1
+          - !Ref Instance1AZ2
+          - !Ref Instance2AZ1
+          - !Ref Instance2AZ2
+          - !Ref Instance3AZ1
+          - !Ref Instance3AZ2
+
+  FirewallLogGroups:
+    Description: "Firewall Log Groups"
+    Value:
+      !Join
+        - ','
+        - - !Ref FirewallLogGroup
+          - !Ref FirewallAlertLogGroup
+
+  FirewallDashboardURI:
+    Description: Link to the CloudWatch Dashboard
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${FirewallDashboard}'
